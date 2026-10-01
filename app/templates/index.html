@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K8s Showcase — {{ color|capitalize }} {{ version }}</title>
+<style>
+  :root{
+    --surface:#ffffff; --surface-2:#f6f7f9; --line:#e3e6ea; --ink:#14181f; --ink-2:#5b6472;
+    --blue:#1456e8; --blue-soft:#eaf0ff; --green:#0e8a4b; --green-soft:#e8f7ef;
+    --amber:#9a6510; --radius:10px;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --surface:#14171c; --surface-2:#1b1f26; --line:#2a2f38; --ink:#eef1f5; --ink-2:#8d96a3;
+      --blue:#5f8fff; --blue-soft:#182544; --green:#3ddc8a; --green-soft:#133526;
+    }
+  }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--surface-2); color:var(--ink); line-height:1.5;}
+  .topbar{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:16px 28px; background:var(--surface); border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex; align-items:center; gap:10px; font-weight:600; font-size:15px;}
+  .brand .mark{width:9px; height:9px; border-radius:2px; background:var(--accent, var(--blue));}
+  .topbar .meta{font-size:12px; color:var(--ink-2); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+
+  .wrap{max-width:1040px; margin:0 auto; padding:28px;}
+  .hero{
+    display:flex; align-items:center; justify-content:space-between; gap:24px;
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+    padding:28px 32px; margin-bottom:20px;
+  }
+  .hero-left .slot{
+    display:inline-flex; align-items:center; gap:8px; font-size:12px; font-weight:600;
+    text-transform:uppercase; letter-spacing:.05em; color:var(--accent-text, var(--blue));
+    background:var(--accent-soft, var(--blue-soft)); padding:4px 10px; border-radius:999px;
+  }
+  .hero-left .version{font-size:40px; font-weight:700; letter-spacing:-.02em; margin:12px 0 4px;}
+  .hero-left .pod{font-size:13px; color:var(--ink-2); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  .pulse{width:8px; height:8px; border-radius:50%; background:currentColor; display:inline-block;
+    animation:pulse 2s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1;} 50%{opacity:.35;}}
+
+  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-bottom:20px;}
+  .card{background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:18px 20px;}
+  .card h3{margin:0 0 4px; font-size:11px; font-weight:600; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--ink-2);}
+  .card .big{font-size:26px; font-weight:700; letter-spacing:-.01em;}
+  .card .sub{font-size:12px; color:var(--ink-2); margin-top:2px;}
+
+  .mixbar{display:flex; height:10px; border-radius:6px; overflow:hidden; margin:10px 0 8px; background:var(--line);}
+  .mixbar .blue-seg{background:var(--blue);}
+  .mixbar .green-seg{background:var(--green);}
+  .mix-legend{display:flex; gap:16px; font-size:12px; color:var(--ink-2);}
+  .mix-legend .dot{width:8px; height:8px; border-radius:2px; display:inline-block; margin-right:5px;}
+
+  .panel{background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:20px;}
+  .panel h2{font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--ink-2); margin:0; padding:16px 20px; border-bottom:1px solid var(--line);}
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  th{text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em;
+    color:var(--ink-2); padding:10px 20px; font-weight:600;}
+  td{padding:9px 20px; border-top:1px solid var(--line);}
+  td.ip{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  .empty{padding:24px 20px; color:var(--ink-2); font-size:13px;}
+
+  .deploy-info{display:grid; grid-template-columns:120px 1fr; gap:8px 16px; padding:18px 20px; font-size:13px;}
+  .deploy-info dt{color:var(--ink-2);}
+  .deploy-info dd{margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  .badge{display:inline-block; font-size:10px; font-weight:600; text-transform:uppercase;
+    letter-spacing:.04em; padding:2px 8px; border-radius:999px; background:var(--surface-2);
+    color:var(--ink-2); border:1px solid var(--line);}
+
+  footer{text-align:center; font-size:12px; color:var(--ink-2); padding:24px;}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand"><span class="mark"></span> K8s Showcase</div>
+    <div class="meta" id="clock"></div>
+  </div>
+
+  <div class="wrap">
+    <div class="hero">
+      <div class="hero-left">
+        <span class="slot" id="slot-badge"><span class="pulse"></span> <span id="slot-text">{{ color }}</span></span>
+        <div class="version">{{ version }}</div>
+        <div class="pod" id="pod-name">pod: —</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Uptime</h3>
+        <div class="big" id="uptime">—</div>
+        <div class="sub">this pod</div>
+      </div>
+      <div class="card">
+        <h3>Recent Visitors</h3>
+        <div class="big" id="visitor-count">—</div>
+        <div class="sub">last 25 requests</div>
+      </div>
+      <div class="card">
+        <h3>Node</h3>
+        <div class="big" id="node-name" style="font-size:16px;">—</div>
+        <div class="sub" id="namespace-name">—</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <h3>Live Traffic Mix</h3>
+      <div class="mixbar" id="mixbar"></div>
+      <div class="mix-legend">
+        <span><span class="dot" style="background:var(--blue)"></span><span id="blue-mix">blue —</span></span>
+        <span><span class="dot" style="background:var(--green)"></span><span id="green-mix">green —</span></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Build</h2>
+      <dl class="deploy-info">
+        <dt>Source</dt><dd id="d-source">—</dd>
+        <dt>Commit</dt><dd id="d-commit">—</dd>
+        <dt>Author</dt><dd id="d-author">—</dd>
+        <dt>Message</dt><dd id="d-message">—</dd>
+      </dl>
+    </div>
+
+    <div class="panel">
+      <h2>Recent Requests</h2>
+      <table>
+        <thead><tr><th>Time (UTC)</th><th>Client IP</th><th>User agent</th></tr></thead>
+        <tbody id="visitor-rows"></tbody>
+      </table>
+      <div class="empty" id="visitor-empty" style="display:none;">No requests recorded yet.</div>
+    </div>
+  </div>
+
+  <footer>HKS / Morpheus Kubernetes Service — KubeCon demo</footer>
+
+<script>
+function applyColorTheme(color){
+  const root = document.documentElement;
+  if (color === 'green') {
+    root.style.setProperty('--accent', 'var(--green)');
+    root.style.setProperty('--accent-text', 'var(--green)');
+    root.style.setProperty('--accent-soft', 'var(--green-soft)');
+  } else {
+    root.style.setProperty('--accent', 'var(--blue)');
+    root.style.setProperty('--accent-text', 'var(--blue)');
+    root.style.setProperty('--accent-soft', 'var(--blue-soft)');
+  }
+}
+applyColorTheme("{{ color }}");
+
+function fmtUptime(s){
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  return (h?h+"h ":"") + (m?m+"m ":"") + sec+"s";
+}
+
+function escapeHtml(s){
+  return (s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function refresh(){
+  fetch('/api/status').then(r => r.json()).then(d => {
+    document.getElementById('pod-name').textContent = 'pod: ' + d.pod;
+    document.getElementById('node-name').textContent = d.node || '—';
+    document.getElementById('namespace-name').textContent = d.namespace;
+    document.getElementById('uptime').textContent = fmtUptime(d.uptimeSeconds);
+    document.getElementById('visitor-count').textContent = d.visitors.length;
+    document.getElementById('slot-text').textContent = d.color;
+    applyColorTheme(d.color);
+
+    const mix = d.podMix;
+    const bar = document.getElementById('mixbar');
+    if (mix) {
+      bar.innerHTML = '<div class="blue-seg" style="width:' + mix.bluePct + '%"></div>' +
+                      '<div class="green-seg" style="width:' + mix.greenPct + '%"></div>';
+      document.getElementById('blue-mix').textContent = 'blue ' + mix.bluePct + '% (' + mix.blueReady + '/' + mix.blue + ' ready)';
+      document.getElementById('green-mix').textContent = 'green ' + mix.greenPct + '% (' + mix.greenReady + '/' + mix.green + ' ready)';
+    } else {
+      bar.innerHTML = '';
+      document.getElementById('blue-mix').textContent = 'blue —';
+      document.getElementById('green-mix').textContent = 'green —';
+    }
+
+    document.getElementById('d-source').innerHTML = '<span class="badge">' + escapeHtml(d.deploy.source || 'catalog') + '</span>';
+    document.getElementById('d-commit').textContent = d.deploy.commitSha ? d.deploy.commitSha.slice(0,10) : 'n/a';
+    document.getElementById('d-author').textContent = d.deploy.commitAuthor || 'n/a';
+    document.getElementById('d-message').textContent = d.deploy.commitMessage || 'n/a';
+
+    const rows = document.getElementById('visitor-rows');
+    const empty = document.getElementById('visitor-empty');
+    if (d.visitors.length === 0) {
+      rows.innerHTML = ''; empty.style.display = 'block';
+    } else {
+      empty.style.display = 'none';
+      rows.innerHTML = d.visitors.map(v =>
+        '<tr><td>'+escapeHtml(v.time)+'</td><td class="ip">'+escapeHtml(v.ip)+'</td><td>'+escapeHtml(v.userAgent)+'</td></tr>'
+      ).join('');
+    }
+  }).catch(() => {});
+}
+
+function tickClock(){
+  document.getElementById('clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
+}
+
+refresh();
+tickClock();
+setInterval(refresh, 3000);
+setInterval(tickClock, 1000);
+</script>
+</body>
+</html>
