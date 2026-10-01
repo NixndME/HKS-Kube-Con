@@ -8,13 +8,14 @@
   :root{
     --surface:#ffffff; --surface-2:#f6f7f9; --line:#e3e6ea; --ink:#14181f; --ink-2:#5b6472;
     --blue:#1456e8; --blue-soft:#eaf0ff; --green:#0e8a4b; --green-soft:#e8f7ef;
-    --amber:#9a6510; --radius:10px;
+    --amber:#9a6510; --red:#b4362c; --radius:10px;
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
   }
   @media (prefers-color-scheme: dark){
     :root{
       --surface:#14171c; --surface-2:#1b1f26; --line:#2a2f38; --ink:#eef1f5; --ink-2:#8d96a3;
       --blue:#5f8fff; --blue-soft:#182544; --green:#3ddc8a; --green-soft:#133526;
+      --red:#e2685c;
     }
   }
   *{box-sizing:border-box;}
@@ -57,6 +58,27 @@
   .mix-legend{display:flex; gap:16px; font-size:12px; color:var(--ink-2);}
   .mix-legend .dot{width:8px; height:8px; border-radius:2px; display:inline-block; margin-right:5px;}
 
+  .rollout{padding:16px 20px; display:flex; flex-wrap:wrap; gap:20px;}
+  .rollout-group{flex:1; min-width:220px;}
+  .rollout-group h4{margin:0 0 8px; font-size:11px; font-weight:600; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--ink-2);}
+  .pod-chip{display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:6px;
+    background:var(--surface-2); border:1px solid var(--line); margin-bottom:6px; font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  .pod-chip .dot{width:8px; height:8px; border-radius:50%; flex-shrink:0; background:var(--ink-2);}
+  .pod-chip.serving .dot{background:var(--green); box-shadow:0 0 0 3px var(--green-soft);}
+  .pod-chip.starting .dot{background:var(--amber); animation:pulse 1.2s ease-in-out infinite;}
+  .pod-chip.terminating{opacity:.55;}
+  .pod-chip.terminating .dot{background:var(--red);}
+  .pod-chip .restarts{color:var(--ink-2);}
+  .pod-chip .state{margin-left:auto; font-size:10px; text-transform:uppercase;
+    letter-spacing:.04em; color:var(--ink-2);}
+  .rollout-empty{color:var(--ink-2); font-size:12px; font-family:inherit;}
+
+  .transition-row{display:flex; gap:14px; padding:9px 20px; font-size:13px; border-top:1px solid var(--line);}
+  .transition-row:first-child{border-top:none;}
+  .transition-time{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--ink-2); flex-shrink:0;}
+
   .panel{background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:20px;}
   .panel h2{font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.05em;
     color:var(--ink-2); margin:0; padding:16px 20px; border-bottom:1px solid var(--line);}
@@ -88,25 +110,25 @@
       <div class="hero-left">
         <span class="slot" id="slot-badge"><span class="pulse"></span> <span id="slot-text">{{ color }}</span></span>
         <div class="version">{{ version }}</div>
-        <div class="pod" id="pod-name">pod: —</div>
+        <div class="pod" id="pod-name">pod: -</div>
       </div>
     </div>
 
     <div class="grid">
       <div class="card">
         <h3>Uptime</h3>
-        <div class="big" id="uptime">—</div>
+        <div class="big" id="uptime">-</div>
         <div class="sub">this pod</div>
       </div>
       <div class="card">
         <h3>Recent Visitors</h3>
-        <div class="big" id="visitor-count">—</div>
+        <div class="big" id="visitor-count">-</div>
         <div class="sub">last 25 requests</div>
       </div>
       <div class="card">
         <h3>Node</h3>
-        <div class="big" id="node-name" style="font-size:16px;">—</div>
-        <div class="sub" id="namespace-name">—</div>
+        <div class="big" id="node-name" style="font-size:16px;">-</div>
+        <div class="sub" id="namespace-name">-</div>
       </div>
     </div>
 
@@ -114,18 +136,29 @@
       <h3>Live Traffic Mix</h3>
       <div class="mixbar" id="mixbar"></div>
       <div class="mix-legend">
-        <span><span class="dot" style="background:var(--blue)"></span><span id="blue-mix">blue —</span></span>
-        <span><span class="dot" style="background:var(--green)"></span><span id="green-mix">green —</span></span>
+        <span><span class="dot" style="background:var(--blue)"></span><span id="blue-mix">blue -</span></span>
+        <span><span class="dot" style="background:var(--green)"></span><span id="green-mix">green -</span></span>
       </div>
+    </div>
+
+    <div class="panel">
+      <h2>Live Rollout</h2>
+      <div class="rollout" id="rollout"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Transition Log</h2>
+      <div id="transition-log"></div>
+      <div class="empty" id="transition-empty">No switches or version changes yet this session.</div>
     </div>
 
     <div class="panel">
       <h2>Build</h2>
       <dl class="deploy-info">
-        <dt>Source</dt><dd id="d-source">—</dd>
-        <dt>Commit</dt><dd id="d-commit">—</dd>
-        <dt>Author</dt><dd id="d-author">—</dd>
-        <dt>Message</dt><dd id="d-message">—</dd>
+        <dt>Source</dt><dd id="d-source">-</dd>
+        <dt>Commit</dt><dd id="d-commit">-</dd>
+        <dt>Author</dt><dd id="d-author">-</dd>
+        <dt>Message</dt><dd id="d-message">-</dd>
       </dl>
     </div>
 
@@ -161,14 +194,81 @@ function fmtUptime(s){
   return (h?h+"h ":"") + (m?m+"m ":"") + sec+"s";
 }
 
+function fmtAge(s){
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m";
+  return Math.floor(s/3600) + "h" + Math.floor((s%3600)/60) + "m";
+}
+
+const TRANSITIONS = [];
+let lastLiveSlot = null;
+let lastVersion = null;
+
+function logTransition(msg){
+  const time = new Date().toISOString().slice(11,19) + " UTC";
+  TRANSITIONS.unshift({time: time, msg: msg});
+  if (TRANSITIONS.length > 8) TRANSITIONS.length = 8;
+  const el = document.getElementById('transition-log');
+  const empty = document.getElementById('transition-empty');
+  empty.style.display = 'none';
+  el.innerHTML = TRANSITIONS.map(t =>
+    '<div class="transition-row"><span class="transition-time">' + t.time + '</span>' +
+    '<span>' + escapeHtml(t.msg) + '</span></div>'
+  ).join('');
+}
+
+function trackTransitions(d){
+  const liveSlot = d.rollout && d.rollout.liveSlot;
+  if (lastLiveSlot !== null && liveSlot && liveSlot !== lastLiveSlot) {
+    logTransition('Live traffic switched from ' + lastLiveSlot.toUpperCase() + ' to ' + liveSlot.toUpperCase());
+  }
+  if (lastVersion !== null && d.version !== lastVersion) {
+    logTransition('Version changed to ' + d.version + ' (' + d.color + ')');
+  }
+  if (liveSlot) lastLiveSlot = liveSlot;
+  lastVersion = d.version;
+}
+
 function escapeHtml(s){
   return (s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function renderRollout(rollout){
+  const el = document.getElementById('rollout');
+  if (!rollout || !rollout.pods || rollout.pods.length === 0) {
+    el.innerHTML = '<div class="rollout-empty">No pod data yet.</div>';
+    return;
+  }
+  const bySlot = {blue: [], green: []};
+  rollout.pods.forEach(p => { if (bySlot[p.slot]) bySlot[p.slot].push(p); });
+
+  const renderGroup = (slot, pods) => {
+    if (pods.length === 0) {
+      return '<div class="rollout-group"><h4>' + slot + '</h4>' +
+             '<div class="rollout-empty">no pods</div></div>';
+    }
+    const chips = pods.map(p => {
+      let cls = 'standby', state = 'standby';
+      if (p.phase === 'Terminating') { cls = 'terminating'; state = 'terminating'; }
+      else if (p.serving) { cls = 'serving'; state = 'live'; }
+      else if (!p.ready) { cls = 'starting'; state = 'starting'; }
+      const shortName = p.name.replace(new RegExp('^k8s-showcase-(blue|green)-'), '');
+      const restarts = p.restarts > 0 ? '<span class="restarts">x' + p.restarts + '</span>' : '';
+      const age = p.ageSeconds != null ? '<span class="restarts">' + fmtAge(p.ageSeconds) + '</span>' : '';
+      return '<div class="pod-chip ' + cls + '"><span class="dot"></span>' +
+             '<span>' + escapeHtml(shortName) + '</span>' + age + restarts +
+             '<span class="state">' + state + '</span></div>';
+    }).join('');
+    return '<div class="rollout-group"><h4>' + slot + '</h4>' + chips + '</div>';
+  };
+
+  el.innerHTML = renderGroup('blue', bySlot.blue) + renderGroup('green', bySlot.green);
 }
 
 function refresh(){
   fetch('/api/status').then(r => r.json()).then(d => {
     document.getElementById('pod-name').textContent = 'pod: ' + d.pod;
-    document.getElementById('node-name').textContent = d.node || '—';
+    document.getElementById('node-name').textContent = d.node || '-';
     document.getElementById('namespace-name').textContent = d.namespace;
     document.getElementById('uptime').textContent = fmtUptime(d.uptimeSeconds);
     document.getElementById('visitor-count').textContent = d.visitors.length;
@@ -184,9 +284,12 @@ function refresh(){
       document.getElementById('green-mix').textContent = 'green ' + mix.greenPct + '% (' + mix.greenReady + '/' + mix.green + ' ready)';
     } else {
       bar.innerHTML = '';
-      document.getElementById('blue-mix').textContent = 'blue —';
-      document.getElementById('green-mix').textContent = 'green —';
+      document.getElementById('blue-mix').textContent = 'blue -';
+      document.getElementById('green-mix').textContent = 'green -';
     }
+
+    renderRollout(d.rollout);
+    trackTransitions(d);
 
     document.getElementById('d-source').innerHTML = '<span class="badge">' + escapeHtml(d.deploy.source || 'catalog') + '</span>';
     document.getElementById('d-commit').textContent = d.deploy.commitSha ? d.deploy.commitSha.slice(0,10) : 'n/a';

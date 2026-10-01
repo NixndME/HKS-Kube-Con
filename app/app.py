@@ -83,6 +83,51 @@ def live_pod_mix():
     }
 
 
+def live_rollout():
+    """Per-pod rollout detail: which individual pod is starting, serving live
+    traffic, or terminating, right now. live_pod_mix() answers "what's the
+    split" -- this answers "which exact pod is which", which is what actually
+    makes a blue-green switch visible as it happens rather than as a single
+    before/after percentage jump. "Serving" means the pod's slot matches the
+    Service's current selector AND the pod is ready AND not mid-termination --
+    a pod can exist and be ready without ever receiving traffic if it's the
+    non-live slot (the normal in-between state right after a Deploy, before
+    a Switch)."""
+    pods_data = _k8s_get(f"/api/v1/namespaces/{NAMESPACE}/pods")
+    svc_data = _k8s_get(f"/api/v1/namespaces/{NAMESPACE}/services/k8s-showcase")
+    live_slot = ((svc_data or {}).get("spec") or {}).get("selector", {}).get("slot")
+    pods = []
+    for item in (pods_data or {}).get("items", []):
+        labels = (item.get("metadata") or {}).get("labels", {}) or {}
+        slot = labels.get("slot")
+        if slot not in ("blue", "green"):
+            continue
+        meta = item.get("metadata") or {}
+        status = item.get("status") or {}
+        statuses = status.get("containerStatuses", []) or []
+        ready = bool(statuses) and all(c.get("ready") for c in statuses)
+        terminating = meta.get("deletionTimestamp") is not None
+        started = status.get("startTime") or meta.get("creationTimestamp")
+        age_seconds = None
+        if started:
+            try:
+                started_dt = datetime.datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
+                age_seconds = int((datetime.datetime.utcnow() - started_dt).total_seconds())
+            except ValueError:
+                pass
+        pods.append({
+            "name": meta.get("name", "unknown"),
+            "slot": slot,
+            "phase": "Terminating" if terminating else status.get("phase", "Unknown"),
+            "ready": ready,
+            "restarts": sum(c.get("restartCount", 0) for c in statuses),
+            "ageSeconds": age_seconds,
+            "serving": slot == live_slot and ready and not terminating,
+        })
+    pods.sort(key=lambda p: (p["slot"], p["name"]))
+    return {"liveSlot": live_slot, "pods": pods}
+
+
 def client_ip():
     fwd = request.headers.get("X-Forwarded-For", "")
     if fwd:
@@ -117,6 +162,7 @@ def status():
         "uptimeSeconds": int(uptime),
         "visitors": list(VISITORS),
         "podMix": live_pod_mix(),
+        "rollout": live_rollout(),
         "deploy": {
             "commitSha": DEPLOY_COMMIT_SHA,
             "commitAuthor": DEPLOY_COMMIT_AUTHOR,
