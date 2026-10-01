@@ -5,7 +5,7 @@ image:
 replicaCount: 3
 
 # blue or green, shown on the page and used for blue-green switching
-color: green
+color: blue
 
 ingress:
   enabled: true
