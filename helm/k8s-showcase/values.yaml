@@ -1,0 +1,11 @@
+image:
+  repository: nginx
+  tag: "1.27"
+
+replicaCount: 2
+
+# blue or green, shown on the page and used for blue-green switching
+color: blue
+
+ingress:
+  enabled: true

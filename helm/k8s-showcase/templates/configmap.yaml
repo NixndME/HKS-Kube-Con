@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-html
+data:
+  # nginx fills in $APP_VERSION and $APP_COLOR on startup. No custom image needed.
+  # The $ signs below are for nginx, not Helm, so Helm leaves them alone.
+  index.html.template: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>K8s Showcase</title>
+    </head>
+    <body style="font-family: sans-serif; text-align: center; margin-top: 10%; background-color: ${APP_COLOR}; color: white;">
+      <h1>Kubernetes Showcase App</h1>
+      <p>Version: ${APP_VERSION}</p>
+      <p>Color: ${APP_COLOR}</p>
+      <p>Running on Morpheus Kubernetes Service</p>
+    </body>
+    </html>

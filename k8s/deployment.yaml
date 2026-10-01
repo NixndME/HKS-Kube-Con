@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-showcase
+  labels:
+    app: k8s-showcase
+spec:
+  # replicaCount, imageTag, appColor are filled in by Morpheus from the order form.
+  replicas: <%= customOptions.replicaCount %>
+  selector:
+    matchLabels:
+      app: k8s-showcase
+  template:
+    metadata:
+      labels:
+        app: k8s-showcase
+        color: "<%= customOptions.appColor %>"
+    spec:
+      containers:
+        - name: nginx
+          image: "nginx:<%= customOptions.imageTag %>"
+          ports:
+            - containerPort: 80
+          env:
+            - name: APP_VERSION
+              value: "<%= customOptions.imageTag %>"
+            - name: APP_COLOR
+              value: "<%= customOptions.appColor %>"
+            - name: NGINX_ENVSUBST_OUTPUT_DIR
+              value: /usr/share/nginx/html
+          volumeMounts:
+            - name: html-template
+              mountPath: /etc/nginx/templates
+      volumes:
+        - name: html-template
+          configMap:
+            name: k8s-showcase-html
