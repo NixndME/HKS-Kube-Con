@@ -1,0 +1,175 @@
+{
+  "dashboard": {
+    "uid": "k8s-showcase-app",
+    "title": "K8s Showcase App",
+    "tags": ["kubecon-demo"],
+    "timezone": "browser",
+    "refresh": "10s",
+    "time": { "from": "now-15m", "to": "now" },
+    "templating": {
+      "list": [
+        {
+          "name": "namespace",
+          "type": "query",
+          "label": "Application (namespace)",
+          "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+          "query": "label_values(kube_namespace_status_phase{phase=\"Active\"}, namespace)",
+          "refresh": 2,
+          "current": { "text": "k8s-showcase", "value": "k8s-showcase" },
+          "includeAll": false,
+          "multi": false
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 10,
+        "title": "All Deployments (click Open to filter the dashboard below)",
+        "type": "table",
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "targets": [
+          { "expr": "kube_deployment_status_replicas_ready{namespace!~\"kube-system|kube-node-lease|kube-public|calico-system|tigera-operator|monitoring|rook-ceph|logging|opencost|ingress-nginx\"}", "format": "table", "instant": true, "refId": "A" },
+          { "expr": "kube_deployment_spec_replicas{namespace!~\"kube-system|kube-node-lease|kube-public|calico-system|tigera-operator|monitoring|rook-ceph|logging|opencost|ingress-nginx\"}", "format": "table", "instant": true, "refId": "B" }
+        ],
+        "transformations": [
+          {
+            "id": "joinByField",
+            "options": { "byField": "deployment", "mode": "outer" }
+          },
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": { "Time": true, "Time 2": true, "container": true, "container 2": true,
+                "instance": true, "instance 2": true, "job": true, "job 2": true,
+                "__name__": true, "__name__ 2": true, "namespace 2": true },
+              "renameByName": { "namespace": "Namespace", "namespace 2": "Namespace", "deployment": "Deployment", "Value #A": "Ready", "Value #B": "Desired" }
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {},
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "Namespace" },
+              "properties": [
+                {
+                  "id": "links",
+                  "value": [
+                    {
+                      "title": "Open this app's dashboard",
+                      "url": "/d/k8s-showcase-app/k8s-showcase-app?var-namespace=${__value.text}"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 3,
+        "title": "Pod restarts",
+        "type": "gauge",
+        "gridPos": { "h": 7, "w": 6, "x": 0, "y": 8 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "targets": [
+          { "expr": "sum(kube_pod_container_status_restarts_total{namespace=\"$namespace\"})", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "min": 0, "max": 10,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 1 },
+                { "color": "red", "value": 5 }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Pods running",
+        "type": "stat",
+        "gridPos": { "h": 7, "w": 6, "x": 6, "y": 8 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "targets": [
+          { "expr": "count(kube_pod_status_phase{namespace=\"$namespace\", phase=\"Running\"} == 1)", "legendFormat": "Pods running", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "fixed", "fixedColor": "green" },
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          }
+        },
+        "options": { "graphMode": "none", "textMode": "value" }
+      },
+      {
+        "id": 5,
+        "title": "Pod count by Deployment",
+        "type": "bargauge",
+        "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "fieldConfig": {
+          "defaults": { "color": { "mode": "continuous-BlPu" } }
+        },
+        "targets": [
+          { "expr": "count(label_replace(kube_pod_info{namespace=\"$namespace\"}, \"workload\", \"$1\", \"created_by_name\", \"(.*)-[a-z0-9]{5,10}$\")) by (workload)", "legendFormat": "{{workload}}", "refId": "A" }
+        ]
+      },
+      {
+        "id": 1,
+        "title": "CPU usage (cores)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "fieldConfig": {
+          "defaults": {
+            "custom": { "fillOpacity": 20, "lineWidth": 2, "gradientMode": "opacity" },
+            "unit": "short"
+          }
+        },
+        "targets": [
+          { "expr": "sum(label_replace(rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", container!=\"\", container!=\"POD\"}[2m]), \"workload\", \"$1\", \"pod\", \"(.*)-[a-z0-9]+-[a-z0-9]{5}$\")) by (workload)", "legendFormat": "{{workload}}", "refId": "A" }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Memory usage (MB)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "fieldConfig": {
+          "defaults": {
+            "custom": { "fillOpacity": 20, "lineWidth": 2, "gradientMode": "opacity" },
+            "unit": "decmbytes"
+          }
+        },
+        "targets": [
+          { "expr": "sum(label_replace(container_memory_working_set_bytes{namespace=\"$namespace\", container!=\"\", container!=\"POD\"}, \"workload\", \"$1\", \"pod\", \"(.*)-[a-z0-9]+-[a-z0-9]{5}$\")) by (workload) / 1024 / 1024", "legendFormat": "{{workload}}", "refId": "A" }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Pod logs (live)",
+        "type": "logs",
+        "gridPos": { "h": 10, "w": 24, "x": 0, "y": 23 },
+        "datasource": { "type": "loki", "uid": "__LOKI_UID__" },
+        "options": {
+          "showTime": true,
+          "showLabels": true,
+          "wrapLogMessage": true,
+          "sortOrder": "Descending",
+          "dedupStrategy": "none"
+        },
+        "targets": [
+          { "expr": "{kubernetes_namespace_name=\"$namespace\"}", "refId": "A" }
+        ]
+      }
+    ]
+  },
+  "overwrite": true
+}

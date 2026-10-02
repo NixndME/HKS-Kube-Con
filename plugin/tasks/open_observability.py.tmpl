@@ -1,0 +1,873 @@
+#!/usr/bin/env python3
+# Expose the Grafana and Prometheus that already run on this Kubernetes cluster
+# (part of the HKS cluster layout) via a NodePort, and print working links.
+# Creates two small Service objects if they do not already exist; never
+# touches the existing Grafana/Prometheus deployments or their own Services.
+#
+# Nothing here is a fixed value for one appliance or one cluster - same
+# dynamic cluster/master lookup as the other tasks.
+
+import json
+import os
+import pty
+import select
+import ssl
+import sys
+import time
+import urllib.request
+
+APPLIANCE_URL = "<%= morpheus.applianceUrl %>"
+API_TOKEN = "<%= morpheus.apiAccessToken %>"
+SSH_USER = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-user') %>''')["data"]
+SSH_PASS = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-password') %>''')["data"]
+
+CLUSTER_NAME = "<%= customOptions.clusterName %>"
+KUBECONFIG = "/etc/kubernetes/admin.conf"
+CTX = ssl._create_unverified_context()
+
+# Optional: see the matching comment in deploy_k8s_showcase.py.tmpl. Left
+# blank by default so this works on any HKS/MKS cluster out of the box.
+PUBLIC_GRAFANA_URL = ""
+
+# (namespace, service name to create, port, a label selector already used by the
+# real Grafana/Prometheus pods, found by reading their own Services)
+TARGETS = [
+    ("monitoring", "k8s-showcase-grafana-access", 3000,
+     "app.kubernetes.io/name=grafana"),
+    ("monitoring", "k8s-showcase-prometheus-access", 9090,
+     "app.kubernetes.io/name=prometheus"),
+]
+
+# OpenCost gives real per-namespace/per-pod cost, computed from each pod's own
+# CPU/memory requests against a reference rate card -- not a guess. This is the
+# plain manifest `helm template` produces for the official opencost/opencost
+# chart (pointed at this cluster's own Prometheus, no persistence, no UI pod).
+# Applied as plain kubectl, not helm: the cluster's master node has no helm
+# binary, and shipping a rendered manifest means the task never depends on
+# reaching an external chart repo at demo time.
+OPENCOST_MANIFEST = r'''
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opencost
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opencost
+  namespace: opencost
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: opencost
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, deployments, nodes, pods, services, resourcequotas,
+                replicationcontrollers, limitranges, persistentvolumeclaims,
+                persistentvolumes, namespaces, endpoints]
+    verbs: [get, list, watch]
+  - apiGroups: [extensions]
+    resources: [daemonsets, deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [statefulsets, deployments, daemonsets, replicasets]
+    verbs: [list, watch]
+  - apiGroups: [batch]
+    resources: [cronjobs, jobs]
+    verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: opencost
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: opencost
+subjects:
+  - kind: ServiceAccount
+    name: opencost
+    namespace: opencost
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opencost
+  namespace: opencost
+spec:
+  selector:
+    app.kubernetes.io/name: opencost
+    app.kubernetes.io/instance: opencost
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 9003
+      targetPort: 9003
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencost
+  namespace: opencost
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opencost
+      app.kubernetes.io/instance: opencost
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opencost
+        app.kubernetes.io/instance: opencost
+    spec:
+      serviceAccountName: opencost
+      volumes:
+        - name: configs
+          emptyDir: {}
+      containers:
+        - name: opencost
+          image: ghcr.io/opencost/opencost:1.121.3
+          ports:
+            - containerPort: 9003
+              name: http
+          # Without a writable /var/configs, OpenCost cannot cache its default
+          # pricing sheet and every cost comes back as 0 (confirmed live).
+          volumeMounts:
+            - name: configs
+              mountPath: /var/configs
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 10m
+              memory: 55Mi
+          readinessProbe:
+            httpGet: {path: /healthz, port: 9003}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          env:
+            - name: PROMETHEUS_SERVER_ENDPOINT
+              value: "http://prometheus-k8s.monitoring.svc:9090"
+            # Deliberately the default, not this cluster's name: OpenCost's own
+            # live Node cache is keyed by this value, but nothing in Prometheus
+            # is labeled with a custom cluster id, so any non-default value here
+            # makes node lookups fail silently and every cost comes back as 0
+            # ("CostModel: failed to find node for <id>/<hostname>" in its log,
+            # confirmed live -- don't change this without re-testing that).
+            - name: CLUSTER_ID
+              value: "default-cluster"
+            - name: CLOUD_COST_ENABLED
+              value: "false"
+'''
+
+# Grafana ships with no [auth] section at all on this layout, so it demands an
+# admin/admin login on every click. Anonymous Viewer access removes that for a
+# demo, read-only, with its own login form disabled so there's nothing to click
+# through by mistake. allow_embedding is harmless here and useful if this ever
+# gets iframed somewhere.
+GRAFANA_INI = """[date_formats]
+default_timezone = UTC
+
+[auth.anonymous]
+enabled = true
+org_name = Main Org.
+org_role = Viewer
+
+[auth]
+disable_login_form = true
+disable_signout_menu = true
+
+[security]
+allow_embedding = true
+"""
+
+# Loki, for real pod logs. Single-binary mode, filesystem storage, no object
+# store -- this is a demo log store, not meant to retain data long-term.
+LOKI_MANIFEST = r'''
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: logging
+data:
+  loki-config.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    common:
+      path_prefix: /loki
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+      replication_factor: 1
+      ring:
+        instance_addr: 127.0.0.1
+        kvstore:
+          store: inmemory
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    limits_config:
+      allow_structured_metadata: false
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: logging
+  labels:
+    app: loki
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.0.0
+          args: ["-config.file=/etc/loki/loki-config.yaml"]
+          ports:
+            - containerPort: 3100
+              name: http
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 300m, memory: 384Mi}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki
+            - name: data
+              mountPath: /loki
+      volumes:
+        - name: config
+          configMap:
+            name: loki-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: logging
+  labels:
+    app: loki
+spec:
+  selector:
+    app: loki
+  ports:
+    - port: 3100
+      targetPort: 3100
+      name: http
+'''
+
+# fluent-bit's own loki output plugin, appended alongside its existing output
+# to Morpheus (never removed). namespace_name/pod_name/container_name become
+# the labels kubernetes_namespace_name/kubernetes_pod_name/kubernetes_container_name
+# -- fluent-bit's loki plugin prefixes nested $kubernetes[...] keys with
+# "kubernetes_" automatically.
+FLUENT_BIT_LOKI_OUTPUT = """[OUTPUT]
+    Name              loki
+    Match             kube.*
+    Host              loki.logging.svc
+    Port              3100
+    Labels            job=fluentbit
+    Label_Keys        $kubernetes['namespace_name'],$kubernetes['pod_name'],$kubernetes['container_name']
+    Remove_Keys       kubernetes,stream,time,log_processed
+    Line_Format       key_value
+    Auto_Kubernetes_Labels Off
+"""
+
+# The Grafana dashboard for this app: resource gauges, a Fleet Overview of every
+# Deployment on the cluster (click a namespace to filter everything below to
+# it), and live logs. __PROM_UID__/__LOKI_UID__ get substituted with whatever
+# datasource uid is actually in use on this appliance -- never assumed fixed,
+# since a datasource may already exist here under a different auto-generated id.
+GRAFANA_DASHBOARD_JSON = r'''
+{
+  "dashboard": {
+    "uid": "k8s-showcase-app",
+    "title": "K8s Showcase App",
+    "tags": ["kubecon-demo"],
+    "timezone": "browser",
+    "refresh": "10s",
+    "time": { "from": "now-15m", "to": "now" },
+    "templating": {
+      "list": [
+        {
+          "name": "namespace",
+          "type": "query",
+          "label": "Application (namespace)",
+          "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+          "query": "label_values(kube_namespace_status_phase{phase=\"Active\"}, namespace)",
+          "refresh": 2,
+          "current": { "text": "k8s-showcase", "value": "k8s-showcase" },
+          "includeAll": false,
+          "multi": false
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 10,
+        "title": "All Deployments (click Open to filter the dashboard below)",
+        "type": "table",
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "targets": [
+          { "expr": "kube_deployment_status_replicas_ready{namespace!~\"kube-system|kube-node-lease|kube-public|calico-system|tigera-operator|monitoring|rook-ceph|logging|opencost|ingress-nginx\"}", "format": "table", "instant": true, "refId": "A" },
+          { "expr": "kube_deployment_spec_replicas{namespace!~\"kube-system|kube-node-lease|kube-public|calico-system|tigera-operator|monitoring|rook-ceph|logging|opencost|ingress-nginx\"}", "format": "table", "instant": true, "refId": "B" }
+        ],
+        "transformations": [
+          {
+            "id": "joinByField",
+            "options": { "byField": "deployment", "mode": "outer" }
+          },
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": { "Time": true, "Time 2": true, "container": true, "container 2": true,
+                "instance": true, "instance 2": true, "job": true, "job 2": true,
+                "__name__": true, "__name__ 2": true, "namespace 2": true },
+              "renameByName": { "namespace": "Namespace", "namespace 2": "Namespace", "deployment": "Deployment", "Value #A": "Ready", "Value #B": "Desired" }
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {},
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "Namespace" },
+              "properties": [
+                {
+                  "id": "links",
+                  "value": [
+                    {
+                      "title": "Open this app's dashboard",
+                      "url": "/d/k8s-showcase-app/k8s-showcase-app?var-namespace=${__value.text}"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 3,
+        "title": "Pod restarts",
+        "type": "gauge",
+        "gridPos": { "h": 7, "w": 6, "x": 0, "y": 8 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "targets": [
+          { "expr": "sum(kube_pod_container_status_restarts_total{namespace=\"$namespace\"})", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "min": 0, "max": 10,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 1 },
+                { "color": "red", "value": 5 }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Pods running",
+        "type": "stat",
+        "gridPos": { "h": 7, "w": 6, "x": 6, "y": 8 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "targets": [
+          { "expr": "count(kube_pod_status_phase{namespace=\"$namespace\", phase=\"Running\"} == 1)", "legendFormat": "Pods running", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "fixed", "fixedColor": "green" },
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          }
+        },
+        "options": { "graphMode": "none", "textMode": "value" }
+      },
+      {
+        "id": 5,
+        "title": "Pod count by Deployment",
+        "type": "bargauge",
+        "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "fieldConfig": {
+          "defaults": { "color": { "mode": "continuous-BlPu" } }
+        },
+        "targets": [
+          { "expr": "count(label_replace(kube_pod_info{namespace=\"$namespace\"}, \"workload\", \"$1\", \"created_by_name\", \"(.*)-[a-z0-9]{5,10}$\")) by (workload)", "legendFormat": "{{workload}}", "refId": "A" }
+        ]
+      },
+      {
+        "id": 1,
+        "title": "CPU usage (cores)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "fieldConfig": {
+          "defaults": {
+            "custom": { "fillOpacity": 20, "lineWidth": 2, "gradientMode": "opacity" },
+            "unit": "short"
+          }
+        },
+        "targets": [
+          { "expr": "sum(label_replace(rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", container!=\"\", container!=\"POD\"}[2m]), \"workload\", \"$1\", \"pod\", \"(.*)-[a-z0-9]+-[a-z0-9]{5}$\")) by (workload)", "legendFormat": "{{workload}}", "refId": "A" }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Memory usage (MB)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+        "datasource": { "type": "prometheus", "uid": "__PROM_UID__" },
+        "fieldConfig": {
+          "defaults": {
+            "custom": { "fillOpacity": 20, "lineWidth": 2, "gradientMode": "opacity" },
+            "unit": "decmbytes"
+          }
+        },
+        "targets": [
+          { "expr": "sum(label_replace(container_memory_working_set_bytes{namespace=\"$namespace\", container!=\"\", container!=\"POD\"}, \"workload\", \"$1\", \"pod\", \"(.*)-[a-z0-9]+-[a-z0-9]{5}$\")) by (workload) / 1024 / 1024", "legendFormat": "{{workload}}", "refId": "A" }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Pod logs (live)",
+        "type": "logs",
+        "gridPos": { "h": 10, "w": 24, "x": 0, "y": 23 },
+        "datasource": { "type": "loki", "uid": "__LOKI_UID__" },
+        "options": {
+          "showTime": true,
+          "showLabels": true,
+          "wrapLogMessage": true,
+          "sortOrder": "Descending",
+          "dedupStrategy": "none"
+        },
+        "targets": [
+          { "expr": "{kubernetes_namespace_name=\"$namespace\"}", "refId": "A" }
+        ]
+      }
+    ]
+  },
+  "overwrite": true
+}
+'''
+
+
+def api_get(path):
+    req = urllib.request.Request(f"{APPLIANCE_URL}{path}", headers={
+        "Authorization": f"Bearer {API_TOKEN}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, context=CTX, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def pick_cluster():
+    clusters = api_get("/api/clusters?max=100").get("clusters", [])
+    k8s = [c for c in clusters
+           if "kubernetes" in (c.get("layout") or {}).get("name", "").lower()
+           or c.get("type") == "kubernetes"]
+    if not k8s:
+        sys.exit("FATAL: no Kubernetes cluster found on this Morpheus.")
+    if CLUSTER_NAME and CLUSTER_NAME.lower() != "null":
+        for c in k8s:
+            if c["name"] == CLUSTER_NAME:
+                return c
+        sys.exit(f"FATAL: no Kubernetes cluster named {CLUSTER_NAME!r} found.")
+    if len(k8s) > 1:
+        names = ", ".join(c["name"] for c in k8s)
+        sys.exit(f"FATAL: more than one Kubernetes cluster exists ({names}). "
+                 f"Run again and pick one in the Cluster Name field.")
+    return k8s[0]
+
+
+def master_ssh_host(cluster):
+    for s in cluster.get("servers", []):
+        if (s.get("computeServerType") or {}).get("nodeType") == "kube-master":
+            detail = api_get(f"/api/servers/{s['id']}").get("server", {})
+            return detail.get("sshHost"), detail.get("sshPort") or 22
+    sys.exit("FATAL: could not find a master node for this cluster.")
+
+
+def ssh_run(host, port, remote_cmd, stdin_data=None, timeout=20):
+    cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
+           "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password",
+           "-o", "ConnectTimeout=8", f"{SSH_USER}@{host}", remote_cmd]
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp(cmd[0], cmd)
+        os._exit(1)
+    output = b""
+    sent_password = False
+    sent_stdin = stdin_data is None
+    start = time.time()
+    while time.time() - start < timeout:
+        r, _, _ = select.select([fd], [], [], 1)
+        if fd in r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if not sent_password and b"assword:" in chunk:
+                os.write(fd, (SSH_PASS + "\n").encode())
+                sent_password = True
+            elif sent_password and not sent_stdin:
+                os.write(fd, stdin_data.encode())
+                os.write(fd, b"\x04")
+                sent_stdin = True
+        else:
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if done != 0:
+                return output.decode(errors="replace"), status
+    # The select loop above only stops READING on timeout -- it does not stop
+    # the remote command. If it's genuinely hung server-side (confirmed live:
+    # a curl with no --max-time, pointed at a hostname that never resolves,
+    # can wedge here for 10+ minutes), a plain blocking waitpid(pid, 0) here
+    # would hang forever too. Force the issue instead.
+    import signal
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        status = 0
+    return output.decode(errors="replace"), status
+
+
+def exit_code_of(raw):
+    return os.WEXITSTATUS(raw) if os.WIFEXITED(raw) else raw
+
+
+def kubectl(host, port, args, stdin_data=None):
+    out, status = ssh_run(host, port, f"sudo kubectl --kubeconfig={KUBECONFIG} {args}", stdin_data)
+    return out.strip(), exit_code_of(status)
+
+
+def write_remote_file_chunked(host, port, remote_path, content):
+    """Write a large payload to a remote file safely. A pty defaults to
+    canonical (line-buffered) mode, whose kernel-side input queue is capped at
+    MAX_CANON (4096 bytes on Linux) -- confirmed live, a single ~8KB stdin_data
+    write (the fluent-bit-config JSON, with Loki's output block added) landed
+    on the remote end truncated to exactly 4095 bytes, corrupting the JSON, no
+    matter how the sending side chunks its own write() calls -- the limit is
+    the kernel's canonical-mode queue, not the syscalls. Sidesteps it by never
+    sending more than one small chunk per SSH session -- each chunk gets its
+    own fresh pty, so no single session's queue ever gets close to the limit."""
+    CHUNK = 3000
+    ssh_run(host, port, f"rm -f {remote_path}")
+    for i in range(0, len(content), CHUNK):
+        chunk = content[i:i + CHUNK]
+        # Not checking exit code per chunk: confirmed live that `cat >> file`
+        # terminated via Ctrl-D in this pty setup reports a nonzero status even
+        # when the write genuinely succeeded. The size check below is the real
+        # verification.
+        ssh_run(host, port, f"cat >> {remote_path}", stdin_data=chunk, timeout=30)
+    out, status = ssh_run(host, port, f"wc -c < {remote_path}")
+    written = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    return written.isdigit() and int(written) == len(content)
+
+
+def ensure_nodeport_service(host, port, namespace, name, svc_port, selector):
+    out, code = kubectl(host, port, f"get svc {name} -n {namespace}")
+    if code == 0:
+        return True
+    manifest = f"""
+apiVersion: v1
+kind: Service
+metadata:
+  name: {name}
+  namespace: {namespace}
+spec:
+  type: NodePort
+  selector: {{{selector.replace('=', ': ')}}}
+  ports:
+    - port: {svc_port}
+      targetPort: {svc_port}
+"""
+    apply_cmd = f"cat > /tmp/{name}.yaml && sudo kubectl --kubeconfig={KUBECONFIG} apply -f /tmp/{name}.yaml"
+    out, status = ssh_run(host, port, apply_cmd, stdin_data=manifest)
+    return exit_code_of(status) == 0
+
+
+def service_url(host, port, namespace, name, selector):
+    out, code = kubectl(host, port,
+        f"get svc {name} -n {namespace} -o jsonpath='{{.spec.ports[0].nodePort}}'")
+    node_port = out.splitlines()[-1].strip() if out else ""
+    if code != 0 or not node_port.isdigit():
+        return None
+    out2, code2 = kubectl(host, port,
+        f"get pods -n {namespace} -l {selector} -o jsonpath='{{.items[0].status.hostIP}}'")
+    node_ip = out2.splitlines()[-1].strip() if out2 else ""
+    target = node_ip if (code2 == 0 and node_ip) else host
+    return f"http://{target}:{node_port}/"
+
+
+def cluster_ip(host, port, namespace, name):
+    """Resolve a Service's real ClusterIP. Needed because curl commands in this
+    task run in the MASTER NODE'S OWN host shell over SSH, not inside a pod --
+    confirmed live that 'x.namespace.svc' cluster-DNS names do not resolve from
+    there (no cluster DNS configured for the host's own /etc/resolv.conf), and
+    a plain curl with no --max-time against an unresolvable host hung for over
+    10 minutes instead of failing fast. Pods (Grafana, OpenCost, fluent-bit)
+    keep using the DNS names internally -- that's correct and unaffected, they
+    have real cluster DNS via their own resolv.conf."""
+    out, code = kubectl(host, port, f"get svc {name} -n {namespace} -o jsonpath='{{.spec.clusterIP}}'")
+    ip = out.splitlines()[-1].strip() if out.strip() else ""
+    return ip if code == 0 and ip else None
+
+
+def ensure_opencost(host, port):
+    """Install OpenCost if it is not already there (checked by looking for its
+    Deployment), then make sure it has a NodePort so the dashboard plugin can
+    reach it. Never reinstalls over an existing one."""
+    out, code = kubectl(host, port, "get deployment opencost -n opencost")
+    if code != 0:
+        apply_cmd = "cat > /tmp/opencost.yaml && sudo kubectl --kubeconfig=%s apply -f /tmp/opencost.yaml" % KUBECONFIG
+        out2, status2 = ssh_run(host, port, apply_cmd, stdin_data=OPENCOST_MANIFEST)
+        if exit_code_of(status2) != 0:
+            print("OPENCOST: could not install it -\n" + out2[-500:])
+            return
+        print("OPENCOST: installed")
+    ok = ensure_nodeport_service(host, port, "opencost", "k8s-showcase-opencost-access", 9003,
+                                  "app.kubernetes.io/name=opencost")
+    if not ok:
+        print("OPENCOST: installed, but could not expose its NodePort yet - try again shortly.")
+        return
+    url = service_url(host, port, "opencost", "k8s-showcase-opencost-access", "app.kubernetes.io/name=opencost")
+    if url:
+        print(f"OPENCOST (real cost data API, used by the dashboard, not meant to be opened directly): {url}")
+    else:
+        print("OPENCOST: exposed, but still starting up - give it a minute.")
+
+
+def curl_post(host, port, url, json_payload, auth=None, method="POST"):
+    """POST/PUT a JSON body over SSH, writing the payload through stdin to a temp
+    file first (same trick as every kubectl-apply call in this file) rather than
+    trying to shell-escape JSON into a remote command string, which breaks on
+    quotes/newlines almost immediately."""
+    tmp = "/tmp/_kcs_payload.json"
+    auth_flag = f"-u {auth} " if auth else ""
+    # --max-time/--connect-timeout are not optional: confirmed live that curl
+    # with none of these, pointed at an address that silently never responds,
+    # does not fail fast -- it hangs far longer than any task should ever run.
+    cmd = (f"cat > {tmp} && curl -s --connect-timeout 5 --max-time 15 {auth_flag}-X {method} '{url}' "
+           f"-H 'Content-Type: application/json' -d @{tmp}")
+    out, status = ssh_run(host, port, cmd, stdin_data=json_payload, timeout=30)
+    return out, exit_code_of(status)
+
+
+def ensure_grafana_anonymous(host, port):
+    """Patch Grafana's config Secret for anonymous Viewer access and a disabled
+    login form, so a demo visitor never hits a password prompt. Idempotent:
+    skips if auth.anonymous is already configured (checked by reading the
+    Secret back, not just assuming). Confirmed live: this Grafana build keeps
+    its whole config in this one Secret, not a ConfigMap."""
+    out, code = kubectl(host, port,
+        r"get secret grafana-config -n monitoring -o jsonpath='{.data.grafana\.ini}'")
+    # Same leading-noise issue as everywhere else: take the last line, not the
+    # whole blob, and decode locally instead of a second remote round trip.
+    b64 = out.splitlines()[-1].strip() if out.strip() else ""
+    if code == 0 and b64:
+        import base64
+        try:
+            decoded = base64.b64decode(b64).decode(errors="replace")
+        except Exception:
+            decoded = ""
+        if "auth.anonymous" in decoded:
+            return False
+    cmd = ("kubectl create secret generic grafana-config -n monitoring "
+           f"--from-file=grafana.ini=/dev/stdin --dry-run=client -o yaml | "
+           f"sudo kubectl --kubeconfig={KUBECONFIG} apply -f -")
+    out2, status2 = ssh_run(host, port, cmd, stdin_data=GRAFANA_INI)
+    if exit_code_of(status2) != 0:
+        print("GRAFANA: could not set up anonymous access -\n" + out2[-400:])
+        return False
+    ssh_run(host, port, f"sudo kubectl --kubeconfig={KUBECONFIG} rollout restart deployment grafana -n monitoring",
+            timeout=15)
+    print("GRAFANA: anonymous Viewer access enabled, login form disabled")
+    return True
+
+
+def extract_json(text):
+    """ssh_run's captured output includes the SSH client's own preamble (host
+    key warnings, the password-prompt echo) before the real remote stdout --
+    confirmed live this breaks json.loads() on the raw string. Same fix every
+    other kubectl-json consumer in this file already uses: find the first
+    '{' or '[' and parse from there."""
+    for ch in ("{", "["):
+        idx = text.find(ch)
+        if idx != -1:
+            try:
+                return json.loads(text[idx:])
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return None
+
+
+def ensure_grafana_datasource(host, port, grafana_ip, ds_type, backend_url, preferred_uid):
+    """Return the uid of a working datasource of this type, creating one with
+    preferred_uid if none exists. Reuses whatever is already there instead of
+    assuming a fixed uid -- this appliance may already have one under an
+    auto-generated id, and forcing a second one would just create a duplicate.
+    backend_url (where Grafana itself should look for Prometheus/Loki) stays a
+    cluster-DNS name on purpose -- Grafana runs as a pod with real cluster DNS,
+    that part was never the problem. grafana_ip is only for reaching Grafana's
+    own API from this task's host-level curl."""
+    out, code = ssh_run(host, port,
+        f"curl -s --connect-timeout 5 --max-time 15 -u admin:admin http://{grafana_ip}:3000/api/datasources",
+        timeout=20)
+    existing = extract_json(out)
+    for ds in existing if isinstance(existing, list) else []:
+        if ds.get("type") == ds_type:
+            return ds.get("uid")
+    payload = json.dumps({"name": ds_type, "type": ds_type, "access": "proxy",
+                           "url": backend_url, "uid": preferred_uid, "isDefault": ds_type == "prometheus"})
+    out2, code2 = curl_post(host, port, f"http://{grafana_ip}:3000/api/datasources",
+                             payload, auth="admin:admin")
+    created = extract_json(out2) or {}
+    uid = (created.get("datasource") or {}).get("uid") or preferred_uid
+    print(f"GRAFANA: {ds_type} datasource ready (uid={uid})")
+    return uid
+
+
+def ensure_loki(host, port):
+    """Install Loki if missing, then wire the cluster's existing fluent-bit into
+    it with a second, additive [OUTPUT] block -- its original output (to
+    Morpheus) is never touched. Returns True if Loki is present/ready."""
+    out, code = kubectl(host, port, "get deployment loki -n logging")
+    if code != 0:
+        apply_cmd = f"cat > /tmp/loki.yaml && sudo kubectl --kubeconfig={KUBECONFIG} apply -f /tmp/loki.yaml"
+        out2, status2 = ssh_run(host, port, apply_cmd, stdin_data=LOKI_MANIFEST)
+        if exit_code_of(status2) != 0:
+            print("LOKI: could not install it -\n" + out2[-500:])
+            return False
+        print("LOKI: installed")
+
+    out3, code3 = kubectl(host, port, "get configmap fluent-bit-config -n logging -o json")
+    if code3 != 0:
+        print("LOKI: installed, but no fluent-bit-config found on this cluster to wire logs through - "
+              "logs may not appear until that's set up.")
+        return True
+    try:
+        start = out3.index("{")
+        cm = json.loads(out3[start:])
+    except (ValueError, json.JSONDecodeError):
+        print("LOKI: installed, but could not read fluent-bit-config to wire logs through.")
+        return True
+    data = cm.get("data", {})
+    if "output-loki.conf" not in data:
+        data["output-loki.conf"] = FLUENT_BIT_LOKI_OUTPUT
+        main_conf = data.get("fluent-bit.conf", "")
+        if "output-loki.conf" not in main_conf and "@INCLUDE output-morpheus.conf" in main_conf:
+            main_conf = main_conf.replace("@INCLUDE output-morpheus.conf",
+                                           "@INCLUDE output-morpheus.conf\n@INCLUDE output-loki.conf")
+            data["fluent-bit.conf"] = main_conf
+        cm["data"] = data
+        for k in ("resourceVersion", "uid", "creationTimestamp"):
+            cm.get("metadata", {}).pop(k, None)
+        payload = json.dumps(cm)
+        ok = write_remote_file_chunked(host, port, "/tmp/fbc.json", payload)
+        if not ok:
+            print("LOKI: installed, but could not write the updated fluent-bit-config to the remote host")
+            return True
+        _, apply_code = kubectl(host, port, "apply -f /tmp/fbc.json")
+        if apply_code != 0:
+            print("LOKI: installed, but applying the updated fluent-bit-config failed")
+            return True
+        ssh_run(host, port, f"sudo kubectl --kubeconfig={KUBECONFIG} rollout restart daemonset fluent-bit -n logging",
+                timeout=15)
+        print("LOKI: wired into fluent-bit for log shipping")
+    return True
+
+
+def ensure_grafana_dashboard(host, port, grafana_ip, prom_uid, loki_uid):
+    """Push the app dashboard (Fleet Overview + resource gauges + live logs),
+    substituting in whichever datasource uids are actually in use. Safe to call
+    every run: the payload's own 'overwrite: true' makes this an update, not a
+    duplicate, same uid every time."""
+    payload = GRAFANA_DASHBOARD_JSON.replace("__PROM_UID__", prom_uid or "").replace("__LOKI_UID__", loki_uid or "")
+    out, code = curl_post(host, port, f"http://{grafana_ip}:3000/api/dashboards/db",
+                           payload, auth="admin:admin")
+    if '"status":"success"' in out:
+        print("GRAFANA: app dashboard ready (Fleet Overview + resource gauges + live logs)")
+    else:
+        print("GRAFANA: could not push the dashboard -\n" + out[-400:])
+
+
+def main():
+    cluster = pick_cluster()
+    print(f"using cluster: {cluster['name']}")
+    host, port = master_ssh_host(cluster)
+
+    for namespace, name, svc_port, selector in TARGETS:
+        label = name.replace("k8s-showcase-", "").replace("-access", "").upper()
+        ok = ensure_nodeport_service(host, port, namespace, name, svc_port, selector)
+        if not ok:
+            print(f"{label}: could not expose it (is it installed on this cluster?)")
+            continue
+        url = service_url(host, port, namespace, name, selector)
+        if url:
+            if label == "GRAFANA" and PUBLIC_GRAFANA_URL:
+                url = PUBLIC_GRAFANA_URL
+            print(f"{label}: {url}")
+        else:
+            print(f"{label}: exposed, but could not work out a URL yet - try again in a moment.")
+
+    ensure_grafana_anonymous(host, port)
+    ensure_opencost(host, port)
+    loki_ready = ensure_loki(host, port)
+
+    grafana_ip = cluster_ip(host, port, "monitoring", "grafana")
+    if not grafana_ip:
+        print("GRAFANA: could not resolve its ClusterIP, skipping datasource/dashboard setup.")
+        return
+    prom_uid = ensure_grafana_datasource(host, port, grafana_ip, "prometheus",
+                                          "http://prometheus-k8s.monitoring.svc:9090", "prometheus")
+    loki_uid = ensure_grafana_datasource(host, port, grafana_ip, "loki",
+                                          "http://loki.logging.svc:3100", "loki") if loki_ready else None
+    ensure_grafana_dashboard(host, port, grafana_ip, prom_uid, loki_uid)
+
+
+if __name__ == "__main__":
+    main()

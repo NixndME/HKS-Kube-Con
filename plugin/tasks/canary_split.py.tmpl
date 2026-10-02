@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+# A real weighted canary split, additive to (not a replacement for) the
+# instant blue-green Switch. Blue-green always sends 100% of traffic to one
+# color; this sends a chosen percentage to a second color at the same time,
+# via ingress-nginx's own canary annotations (two Ingress objects sharing the
+# same path: a primary with no canary annotation, and a canary one with
+# nginx.ingress.kubernetes.io/canary-weight). Set weight to 0 to turn it off
+# cleanly -- the canary Ingress is deleted entirely, not just weighted to 0,
+# so there is no lingering object left behind.
+#
+# Needs each color to be addressable on its own, independent of which one the
+# main Switch currently considers "live" -- so this creates two small, fixed
+# ClusterIP Services (one per color) the first time it runs, separate from
+# the switch-controlled k8s-showcase Service. Nothing here is a fixed value
+# for one appliance, same dynamic cluster/master lookup as every other task.
+
+import json
+import os
+import pty
+import select
+import ssl
+import sys
+import time
+import urllib.request
+
+APPLIANCE_URL = "<%= morpheus.applianceUrl %>"
+API_TOKEN = "<%= morpheus.apiAccessToken %>"
+SSH_USER = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-user') %>''')["data"]
+SSH_PASS = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-password') %>''')["data"]
+
+CLUSTER_NAME = "<%= customOptions.clusterName %>"
+CANARY_COLOR = "<%= customOptions.canaryColor %>"
+WEIGHT = "<%= customOptions.canaryWeight %>"
+
+NAMESPACE = "k8s-showcase"
+KUBECONFIG = "/etc/kubernetes/admin.conf"
+CTX = ssl._create_unverified_context()
+
+
+def api_get(path):
+    req = urllib.request.Request(f"{APPLIANCE_URL}{path}", headers={
+        "Authorization": f"Bearer {API_TOKEN}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, context=CTX, timeout=25) as r:
+        return json.loads(r.read().decode())
+
+
+def pick_cluster():
+    clusters = api_get("/api/clusters?max=100").get("clusters", [])
+    k8s = [c for c in clusters
+           if "kubernetes" in (c.get("layout") or {}).get("name", "").lower()
+           or c.get("type") == "kubernetes"]
+    if not k8s:
+        sys.exit("FATAL: no Kubernetes cluster found on this Morpheus.")
+    if CLUSTER_NAME and CLUSTER_NAME.lower() != "null":
+        for c in k8s:
+            if c["name"] == CLUSTER_NAME:
+                return c
+        sys.exit(f"FATAL: no Kubernetes cluster named {CLUSTER_NAME!r} found.")
+    if len(k8s) > 1:
+        names = ", ".join(c["name"] for c in k8s)
+        sys.exit(f"FATAL: more than one Kubernetes cluster exists ({names}). "
+                 f"Run again and pick one in the Cluster Name field.")
+    return k8s[0]
+
+
+def master_ssh_host(cluster):
+    for s in cluster.get("servers", []):
+        if (s.get("computeServerType") or {}).get("nodeType") == "kube-master":
+            detail = api_get(f"/api/servers/{s['id']}").get("server", {})
+            return detail.get("sshHost"), detail.get("sshPort") or 22
+    sys.exit("FATAL: could not find a master node for this cluster.")
+
+
+def ssh_run(host, port, remote_cmd, stdin_data=None, timeout=30):
+    cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
+           "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password",
+           "-o", "ConnectTimeout=10", f"{SSH_USER}@{host}", remote_cmd]
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp(cmd[0], cmd)
+        os._exit(1)
+    output = b""
+    sent_password = False
+    sent_stdin = stdin_data is None
+    start = time.time()
+    while time.time() - start < timeout:
+        r, _, _ = select.select([fd], [], [], 1)
+        if fd in r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if not sent_password and b"assword:" in chunk:
+                os.write(fd, (SSH_PASS + "\n").encode())
+                sent_password = True
+            elif sent_password and not sent_stdin:
+                os.write(fd, stdin_data.encode())
+                os.write(fd, b"\x04")
+                sent_stdin = True
+        else:
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if done != 0:
+                return output.decode(errors="replace"), status
+    import signal
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        status = 0
+    return output.decode(errors="replace"), status
+
+
+def exit_code_of(raw):
+    return os.WEXITSTATUS(raw) if os.WIFEXITED(raw) else raw
+
+
+def kubectl(host, port, args, stdin_data=None):
+    out, status = ssh_run(host, port, f"sudo kubectl --kubeconfig={KUBECONFIG} {args}", stdin_data)
+    return out.strip(), exit_code_of(status)
+
+
+def find_ingress_class(host, port):
+    out, code = kubectl(host, port, "get ingressclass -o json")
+    if code != 0:
+        return None
+    try:
+        start = out.index("{")
+        data = json.loads(out[start:])
+    except (ValueError, json.JSONDecodeError):
+        return None
+    for item in data.get("items", []):
+        controller = (item.get("spec") or {}).get("controller", "")
+        if "ingress-nginx" in controller:
+            return item["metadata"]["name"]
+    return None
+
+
+def ensure_direct_services(host, port):
+    """One fixed ClusterIP Service per color, always pointing at that color's
+    pods regardless of which one the main Switch currently treats as live.
+    Created once, left in place after -- deleting them would break a canary
+    Ingress that still references them."""
+    manifest = f"""
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-showcase-blue-direct
+  namespace: {NAMESPACE}
+spec:
+  selector:
+    app: k8s-showcase
+    slot: "blue"
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-showcase-green-direct
+  namespace: {NAMESPACE}
+spec:
+  selector:
+    app: k8s-showcase
+    slot: "green"
+  ports:
+    - port: 80
+      targetPort: 8080
+"""
+    apply_cmd = f"cat > /tmp/kcs-direct-svc.yaml && sudo kubectl --kubeconfig={KUBECONFIG} apply -f /tmp/kcs-direct-svc.yaml"
+    out, status = ssh_run(host, port, apply_cmd, stdin_data=manifest)
+    return exit_code_of(status) == 0, out
+
+
+def build_canary_ingress(color, weight, ingress_class):
+    ingress_class_line = f"  ingressClassName: {ingress_class}\n" if ingress_class else ""
+    return f"""
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k8s-showcase-canary
+  namespace: {NAMESPACE}
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "{weight}"
+spec:
+{ingress_class_line}  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: k8s-showcase-{color}-direct
+                port:
+                  number: 80
+"""
+
+
+def main():
+    for label, value in [("canaryColor", CANARY_COLOR), ("canaryWeight", WEIGHT)]:
+        if value is None or str(value).strip().lower() in ("", "null"):
+            sys.exit(f"FATAL: {label} was not set on the order form.")
+    if CANARY_COLOR not in ("blue", "green"):
+        sys.exit(f"FATAL: canaryColor must be 'blue' or 'green', got {CANARY_COLOR!r}.")
+    if not WEIGHT.isdigit() or not (0 <= int(WEIGHT) <= 100):
+        sys.exit(f"FATAL: canaryWeight must be a whole number from 0 to 100, got {WEIGHT!r}.")
+    weight = int(WEIGHT)
+
+    cluster = pick_cluster()
+    print(f"using cluster: {cluster['name']}")
+    host, port = master_ssh_host(cluster)
+
+    out, code = kubectl(host, port, "get namespace k8s-showcase")
+    if code != 0:
+        sys.exit("FATAL: k8s-showcase namespace does not exist yet. "
+                 "Order 'Deploy K8s Showcase App' first.")
+
+    if weight == 0:
+        out, code = kubectl(host, port, "delete ingress k8s-showcase-canary -n %s --ignore-not-found" % NAMESPACE)
+        print(out)
+        print("Canary split: off. 100% of traffic goes through the normal blue-green Service.")
+        return
+
+    out, code = kubectl(host, port,
+        f"get deployment k8s-showcase-{CANARY_COLOR} -n {NAMESPACE} -o jsonpath='{{.status.readyReplicas}}'")
+    if code != 0:
+        sys.exit(f"FATAL: slot {CANARY_COLOR!r} has not been deployed yet. "
+                 f"Order 'Deploy K8s Showcase App' with color={CANARY_COLOR!r} first.")
+    ready = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if not ready.isdigit() or int(ready) < 1:
+        sys.exit(f"FATAL: slot {CANARY_COLOR!r} is deployed but has no ready pods "
+                 f"(it may be scaled to 0) -- sending real traffic to it would just fail. "
+                 f"Order 'Deploy K8s Showcase App' with color={CANARY_COLOR!r} first, "
+                 f"or 'Rollback K8s Showcase App' to bring it back up.")
+
+    ok, out = ensure_direct_services(host, port)
+    if not ok:
+        sys.exit(f"FATAL: could not create the per-color direct Services -\n{out[-400:]}")
+    print("direct per-color Services ready")
+
+    ingress_class = find_ingress_class(host, port)
+    apply_cmd = f"cat > /tmp/kcs-canary.yaml && sudo kubectl --kubeconfig={KUBECONFIG} apply -f /tmp/kcs-canary.yaml"
+    out, status = ssh_run(host, port, apply_cmd, stdin_data=build_canary_ingress(CANARY_COLOR, weight, ingress_class))
+    print(out)
+    if exit_code_of(status) != 0:
+        sys.exit(f"FATAL: applying the canary Ingress failed, exit code {exit_code_of(status)}")
+
+    live, _ = kubectl(host, port, f"get svc k8s-showcase -n {NAMESPACE} -o jsonpath='{{.spec.selector.slot}}'")
+    live = live.splitlines()[-1].strip() if live.strip() else "unknown"
+    print(f"Canary split: {weight}% of traffic now goes to slot {CANARY_COLOR!r}, "
+          f"the rest ({100 - weight}%) goes to whichever slot is live via the normal "
+          f"Switch mechanism (currently {live!r}).")
+
+
+if __name__ == "__main__":
+    main()

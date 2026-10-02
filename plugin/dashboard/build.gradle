@@ -1,0 +1,68 @@
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        maven { url "https://plugins.gradle.org/m2/" }
+    }
+    dependencies {
+        classpath "com.github.johnrengelman:shadow:8.1.1"
+        classpath "com.bertramlabs.plugins:asset-pipeline-gradle:$assetPipelineVersion"
+    }
+}
+
+apply plugin: 'java'
+apply plugin: 'groovy'
+apply plugin: 'com.github.johnrengelman.shadow'
+apply plugin: 'asset-pipeline'
+
+group = 'com.kubecon'
+version = '0.1.2'
+
+// The appliance classloader rejects bytecode newer than this. Build on a newer
+// JDK, just never target it.
+java {
+    sourceCompatibility = JavaVersion.toVersion('1.11')
+    targetCompatibility = JavaVersion.toVersion('1.11')
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+// provided = on the compile classpath, left out of the shipped jar, since the
+// appliance already has these.
+configurations { provided }
+
+dependencies {
+    provided "com.morpheusdata:morpheus-plugin-api:$morphPluginApiVersion"
+    provided "org.codehaus.groovy:groovy-all:$groovyVersion"
+    implementation "org.slf4j:slf4j-api:$slf4jVersion"
+}
+
+sourceSets { main { compileClasspath += configurations.provided } }
+
+jar {
+    manifest {
+        attributes(
+            'Plugin-Class': 'com.kubecon.dashboard.K8sShowcasePlugin',
+            'Plugin-Version': archiveVersion.get(),
+            'Morpheus-Name': 'K8s Showcase Dashboard',
+            'Morpheus-Organization': 'kubecon-demo',
+            'Morpheus-Code': 'kubecon-k8s-showcase-dashboard',
+            'Morpheus-Description': 'ArgoCD-style dashboard for the K8s Showcase KubeCon demo app.',
+            'Morpheus-Labels': 'Plugin,Dashboard,KubeCon',
+            'Morpheus-Min-Appliance-Version': '9.0.0'
+        )
+    }
+}
+
+assets {
+    packagePlugin = false
+}
+
+shadowJar {
+    archiveClassifier.set('all')
+    exclude 'assets/webjars/**'
+}
+tasks.assemble.dependsOn tasks.shadowJar

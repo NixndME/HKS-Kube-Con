@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+# Deploy the K8s Showcase sample app onto a Kubernetes cluster this Morpheus manages.
+# Runs ON the Morpheus appliance. Finds the cluster, finds its master node, then
+# runs kubectl on that node over SSH. Everything goes into its own namespace.
+#
+# Nothing here is a fixed value for one appliance. The appliance URL and API token
+# come from Morpheus itself. The SSH login comes from Cypher secrets, not a literal
+# password. The cluster, its master node, and the ingress port are all looked up
+# at run time, never hardcoded.
+
+import json
+import os
+import pty
+import select
+import ssl
+import sys
+import time
+import urllib.request
+
+APPLIANCE_URL = "<%= morpheus.applianceUrl %>"
+API_TOKEN = "<%= morpheus.apiAccessToken %>"
+# cypher.read() on this appliance returns the stored value already wrapped as
+# JSON text (e.g. {"data":"nixndme"}), not the bare string. Parse it rather
+# than fight the storage format. Triple-single-quotes survive the double
+# quotes inside that JSON text without breaking this string literal.
+SSH_USER = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-user') %>''')["data"]
+SSH_PASS = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-password') %>''')["data"]
+
+CLUSTER_NAME = "<%= customOptions.clusterName %>"
+IMAGE_TAG = "<%= customOptions.imageTag %>"
+APP_COLOR = "<%= customOptions.appColor %>"
+REPLICA_COUNT = "<%= customOptions.replicaCount %>"
+# Who/what produced this deploy. Empty/blank when ordered by hand from the
+# catalog (the normal case) -- the GitOps poller fills these in when it
+# triggers a redeploy on its own, so the app and the dashboard can show
+# exactly which commit is running and who committed it.
+COMMIT_SHA = "<%= customOptions.commitSha %>"
+COMMIT_AUTHOR = "<%= customOptions.commitAuthor %>"
+COMMIT_MESSAGE = "<%= customOptions.commitMessage %>"
+DEPLOY_SOURCE = "<%= customOptions.deploySource %>"
+
+# The demo app's own image. A real build, not a placeholder: see
+# HKS-Kube-Con/app/ for the Flask source and Dockerfile this was built from.
+APP_IMAGE = "nixndme/hks-kubecon-demo"
+
+NAMESPACE = "k8s-showcase"
+KUBECONFIG = "/etc/kubernetes/admin.conf"  # standard kubeadm location
+
+# Optional: if you've put your own public hostname in front of this cluster
+# (e.g. a reverse proxy or tunnel), set it here and it's used instead of the
+# raw NodePort URL. Left blank by default so a fresh install on any HKS/MKS
+# cluster just works off the node's real IP and NodePort.
+PUBLIC_APP_URL = ""
+CTX = ssl._create_unverified_context()
+
+
+def api_get(path):
+    req = urllib.request.Request(f"{APPLIANCE_URL}{path}", headers={
+        "Authorization": f"Bearer {API_TOKEN}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, context=CTX, timeout=25) as r:
+        return json.loads(r.read().decode())
+
+
+def pick_cluster():
+    clusters = api_get("/api/clusters?max=100").get("clusters", [])
+    k8s_clusters = [c for c in clusters
+                    if "kubernetes" in (c.get("layout") or {}).get("name", "").lower()
+                    or c.get("type") == "kubernetes"]
+    if not k8s_clusters:
+        sys.exit("FATAL: no Kubernetes cluster found on this Morpheus. Create or onboard one first.")
+    if CLUSTER_NAME and CLUSTER_NAME.lower() != "null":
+        for c in k8s_clusters:
+            if c["name"] == CLUSTER_NAME:
+                return c
+        sys.exit(f"FATAL: no Kubernetes cluster named {CLUSTER_NAME!r} found.")
+    if len(k8s_clusters) > 1:
+        names = ", ".join(c["name"] for c in k8s_clusters)
+        sys.exit(f"FATAL: more than one Kubernetes cluster exists ({names}). "
+                 f"Order again and pick one in the Cluster Name field.")
+    return k8s_clusters[0]
+
+
+def master_ssh_host(cluster):
+    for s in cluster.get("servers", []):
+        node_type = (s.get("computeServerType") or {}).get("nodeType", "")
+        if node_type == "kube-master":
+            detail = api_get(f"/api/servers/{s['id']}").get("server", {})
+            return detail.get("sshHost"), detail.get("sshPort") or 22
+    sys.exit("FATAL: could not find a master node for this cluster.")
+
+
+def find_ingress_class(host, port):
+    """Look up a real IngressClass whose controller is ingress-nginx, rather
+    than assuming the name 'nginx'. Returns None if none is found, in which
+    case the Ingress is created without one (fine if a default class is set,
+    otherwise it just won't get picked up, and find_demo_url will say so)."""
+    cmd = f"sudo kubectl --kubeconfig={KUBECONFIG} get ingressclass -o json"
+    out, status = ssh_run(host, port, cmd)
+    if exit_code_of(status) != 0:
+        return None
+    try:
+        start = out.index("{")
+        data = json.loads(out[start:])
+    except (ValueError, json.JSONDecodeError):
+        return None
+    for item in data.get("items", []):
+        controller = (item.get("spec") or {}).get("controller", "")
+        if "ingress-nginx" in controller:
+            return item["metadata"]["name"]
+    return None
+
+
+def build_app_manifest():
+    """Namespace, RBAC, the Secret, and this order's Deployment. Always
+    applied, every order. The Deployment is named per-color (k8s-showcase-blue
+    / k8s-showcase-green) so a blue and a green version can run at the same
+    time - that's what makes a blue-green switch possible, rather than this
+    order just overwriting whatever was running before.
+
+    The app itself is a real custom image (nixndme/hks-kubecon-demo, built
+    from HKS-Kube-Con/app/), not nginx with a templated static page - it reads
+    its own live pod mix from the Kubernetes API (hence the RBAC below, scoped
+    to read-only on pods in this one namespace, nothing more)."""
+    commit_sha = COMMIT_SHA if COMMIT_SHA and COMMIT_SHA.lower() != "null" else ""
+    commit_author = COMMIT_AUTHOR if COMMIT_AUTHOR and COMMIT_AUTHOR.lower() != "null" else ""
+    commit_message = COMMIT_MESSAGE if COMMIT_MESSAGE and COMMIT_MESSAGE.lower() != "null" else ""
+    deploy_source = DEPLOY_SOURCE if DEPLOY_SOURCE and DEPLOY_SOURCE.lower() != "null" else "catalog"
+    return f"""
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {NAMESPACE}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k8s-showcase-secret
+  namespace: {NAMESPACE}
+type: Opaque
+stringData:
+  demoApiKey: "demo-only-not-a-real-credential"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-showcase-app
+  namespace: {NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-showcase-app-pod-reader
+  namespace: {NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["k8s-showcase"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-showcase-app-pod-reader
+  namespace: {NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k8s-showcase-app-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: k8s-showcase-app
+    namespace: {NAMESPACE}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-showcase-{APP_COLOR}
+  namespace: {NAMESPACE}
+  labels:
+    app: k8s-showcase
+    slot: "{APP_COLOR}"
+spec:
+  replicas: {REPLICA_COUNT}
+  selector:
+    matchLabels:
+      app: k8s-showcase
+      slot: "{APP_COLOR}"
+  template:
+    metadata:
+      labels:
+        app: k8s-showcase
+        slot: "{APP_COLOR}"
+    spec:
+      serviceAccountName: k8s-showcase-app
+      containers:
+        - name: app
+          image: "{APP_IMAGE}:{IMAGE_TAG}"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: {{path: /healthz, port: 8080}}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          # Resource requests, not just a nice-to-have: OpenCost (and any real
+          # cost tool) allocates cluster cost to a pod based on what it requests,
+          # not what it happens to use. No requests means no cost ever shows up
+          # for this app, which would make the dashboard's cost panel pointless.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          env:
+            - name: APP_VERSION
+              value: "{IMAGE_TAG}"
+            - name: APP_COLOR
+              value: "{APP_COLOR}"
+            - name: POD_NAMESPACE
+              valueFrom: {{fieldRef: {{fieldPath: metadata.namespace}}}}
+            - name: NODE_NAME
+              valueFrom: {{fieldRef: {{fieldPath: spec.nodeName}}}}
+            - name: DEPLOY_COMMIT_SHA
+              value: "{commit_sha}"
+            - name: DEPLOY_COMMIT_AUTHOR
+              value: "{commit_author}"
+            - name: DEPLOY_COMMIT_MESSAGE
+              value: "{commit_message}"
+            - name: DEPLOY_SOURCE
+              value: "{deploy_source}"
+            - name: DEMO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: k8s-showcase-secret
+                  key: demoApiKey
+"""
+
+
+def build_service_manifest(ingress_class):
+    """The Service and Ingress. Applied only the first time (see main()) -
+    once a Service exists, which slot it sends traffic to is the switch
+    task's job, not this one's. Re-applying this every order would undo a
+    deliberate blue-green cutover on every single deploy."""
+    ingress_class_line = f"  ingressClassName: {ingress_class}\n" if ingress_class else ""
+    return f"""
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-showcase
+  namespace: {NAMESPACE}
+spec:
+  type: ClusterIP
+  selector:
+    app: k8s-showcase
+    slot: "{APP_COLOR}"
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k8s-showcase
+  namespace: {NAMESPACE}
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+{ingress_class_line}  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: k8s-showcase
+                port:
+                  number: 80
+"""
+
+
+def ssh_run(host, port, remote_cmd, stdin_data=None, timeout=60):
+    """SSH to host, log in with a password, optionally feed stdin_data after
+    login. Uses a real pty so ssh gets a controlling terminal for the
+    password prompt."""
+    # Forced to password auth on purpose: this runs on the Morpheus appliance,
+    # which has no reason to hold an SSH key for the cluster's nodes.
+    cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
+           "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password",
+           "-o", "ConnectTimeout=10", f"{SSH_USER}@{host}", remote_cmd]
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp(cmd[0], cmd)
+        os._exit(1)
+    output = b""
+    sent_password = False
+    sent_stdin = stdin_data is None
+    start = time.time()
+    while time.time() - start < timeout:
+        r, _, _ = select.select([fd], [], [], 1)
+        if fd in r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                # The pty closes this way once the remote command exits.
+                break
+            if not chunk:
+                break
+            output += chunk
+            if not sent_password and b"assword:" in chunk:
+                os.write(fd, (SSH_PASS + "\n").encode())
+                sent_password = True
+            elif sent_password and not sent_stdin:
+                os.write(fd, stdin_data.encode())
+                os.write(fd, b"\x04")  # EOF (Ctrl-D)
+                sent_stdin = True
+        else:
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if done != 0:
+                return output.decode(errors="replace"), status
+    # Loop above only stops reading on timeout, it doesn't stop the remote
+    # command -- a genuinely hung remote command would make a plain blocking
+    # waitpid here hang forever too. Force it.
+    import signal
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        status = 0
+    return output.decode(errors="replace"), status
+
+
+def exit_code_of(raw_status):
+    return os.WEXITSTATUS(raw_status) if os.WIFEXITED(raw_status) else raw_status
+
+
+def find_demo_url(host, port):
+    """Look up the ingress-nginx NodePort for plain HTTP, if ingress-nginx is
+    installed on this cluster. Never hardcode the port: it is assigned by
+    Kubernetes and can differ from one cluster to the next.
+
+    Points the URL at whichever node actually hosts the ingress-nginx pod,
+    not just the master. Confirmed live on this cluster: NodePort traffic
+    that has to cross between nodes over the overlay network never arrives
+    (a real cluster networking issue, worth fixing separately), while
+    hitting the node that locally runs the pod works every time. Pointing
+    at the right node from the start sidesteps that instead of depending
+    on cross-node forwarding working."""
+    cmd = (f"sudo kubectl --kubeconfig={KUBECONFIG} get svc -n ingress-nginx "
+           f"ingress-nginx-controller -o jsonpath='{{.spec.ports[?(@.port==80)].nodePort}}'")
+    out, status = ssh_run(host, port, cmd)
+    node_port = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if exit_code_of(status) != 0 or not node_port.isdigit():
+        return None
+
+    node_ip_cmd = (f"sudo kubectl --kubeconfig={KUBECONFIG} get pods -n ingress-nginx "
+                   f"-l app.kubernetes.io/component=controller "
+                   f"-o jsonpath='{{.items[0].status.hostIP}}'")
+    out2, status2 = ssh_run(host, port, node_ip_cmd)
+    node_ip = out2.strip().splitlines()[-1].strip() if out2.strip() else ""
+    target = node_ip if (exit_code_of(status2) == 0 and node_ip) else host
+    return PUBLIC_APP_URL or f"http://{target}:{node_port}/"
+
+
+def service_exists(host, port):
+    cmd = f"sudo kubectl --kubeconfig={KUBECONFIG} get svc k8s-showcase -n {NAMESPACE}"
+    _, status = ssh_run(host, port, cmd)
+    return exit_code_of(status) == 0
+
+
+def live_slot(host, port):
+    cmd = (f"sudo kubectl --kubeconfig={KUBECONFIG} get svc k8s-showcase -n {NAMESPACE} "
+           f"-o jsonpath='{{.spec.selector.slot}}'")
+    out, status = ssh_run(host, port, cmd)
+    if exit_code_of(status) != 0:
+        return None
+    return out.strip().splitlines()[-1].strip() if out.strip() else None
+
+
+def main():
+    for label, value in [("imageTag", IMAGE_TAG), ("appColor", APP_COLOR),
+                          ("replicaCount", REPLICA_COUNT)]:
+        if value is None or str(value).strip().lower() in ("", "null"):
+            sys.exit(f"FATAL: {label} was not set on the order form.")
+    if APP_COLOR not in ("blue", "green"):
+        sys.exit(f"FATAL: appColor must be 'blue' or 'green', got {APP_COLOR!r}.")
+
+    cluster = pick_cluster()
+    print(f"using cluster: {cluster['name']}")
+    host, port = master_ssh_host(cluster)
+    print(f"master node: {host}:{port}")
+
+    apply_cmd = (f"cat > /tmp/k8s-showcase.yaml && "
+                 f"sudo kubectl --kubeconfig={KUBECONFIG} apply -f /tmp/k8s-showcase.yaml")
+    out, raw_status = ssh_run(host, port, apply_cmd, stdin_data=build_app_manifest())
+    print(out)
+    if exit_code_of(raw_status) != 0:
+        sys.exit(f"FATAL: kubectl apply failed, exit code {exit_code_of(raw_status)}")
+    print(f"Deployed slot {APP_COLOR!r} (k8s-showcase-{APP_COLOR}) into namespace {NAMESPACE!r}.")
+
+    had_service = service_exists(host, port)
+    if not had_service:
+        ingress_class = find_ingress_class(host, port)
+        out2, status2 = ssh_run(host, port, apply_cmd, stdin_data=build_service_manifest(ingress_class))
+        print(out2)
+        if exit_code_of(status2) != 0:
+            sys.exit(f"FATAL: creating the Service/Ingress failed, exit code {exit_code_of(status2)}")
+        print(f"First deploy: slot {APP_COLOR!r} is now live.")
+    else:
+        live = live_slot(host, port)
+        if live == APP_COLOR:
+            print(f"Slot {APP_COLOR!r} is already live - this updated the running version in place.")
+        else:
+            print(f"Slot {APP_COLOR!r} is deployed but NOT live yet (live slot is {live!r}). "
+                  f"Run the 'Switch K8s Showcase Traffic' action to cut traffic over to it.")
+
+    url = find_demo_url(host, port)
+    if url:
+        print(f"Open it here: {url}")
+    else:
+        print("Could not find an ingress-nginx NodePort to build a URL. "
+              "The app is reachable inside the cluster at "
+              f"k8s-showcase.{NAMESPACE}.svc.cluster.local:80.")
+
+
+if __name__ == "__main__":
+    main()

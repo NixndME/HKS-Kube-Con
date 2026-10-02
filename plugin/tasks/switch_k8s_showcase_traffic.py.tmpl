@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+# Flip live traffic for the K8s Showcase app between its blue and green
+# deployments. Does not deploy anything new - it only changes which already
+# deployed slot the Service sends traffic to. Order "Deploy K8s Showcase App"
+# first for whichever slot you want to switch to, if it isn't deployed yet.
+#
+# Nothing here is a fixed value for one appliance, same as the deploy task.
+
+import json
+import os
+import pty
+import select
+import ssl
+import sys
+import time
+import urllib.request
+
+APPLIANCE_URL = "<%= morpheus.applianceUrl %>"
+API_TOKEN = "<%= morpheus.apiAccessToken %>"
+SSH_USER = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-user') %>''')["data"]
+SSH_PASS = json.loads(r'''<%= cypher.read('secret/hks-showcase-ssh-password') %>''')["data"]
+
+CLUSTER_NAME = "<%= customOptions.clusterName %>"
+
+NAMESPACE = "k8s-showcase"
+KUBECONFIG = "/etc/kubernetes/admin.conf"
+CTX = ssl._create_unverified_context()
+
+# Optional: see the matching comment in deploy_k8s_showcase.py.tmpl. Left
+# blank by default so this works on any HKS/MKS cluster out of the box.
+PUBLIC_APP_URL = ""
+
+
+def api_get(path):
+    req = urllib.request.Request(f"{APPLIANCE_URL}{path}", headers={
+        "Authorization": f"Bearer {API_TOKEN}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, context=CTX, timeout=25) as r:
+        return json.loads(r.read().decode())
+
+
+def pick_cluster():
+    clusters = api_get("/api/clusters?max=100").get("clusters", [])
+    k8s_clusters = [c for c in clusters
+                    if "kubernetes" in (c.get("layout") or {}).get("name", "").lower()
+                    or c.get("type") == "kubernetes"]
+    if not k8s_clusters:
+        sys.exit("FATAL: no Kubernetes cluster found on this Morpheus. Create or onboard one first.")
+    if CLUSTER_NAME and CLUSTER_NAME.lower() != "null":
+        for c in k8s_clusters:
+            if c["name"] == CLUSTER_NAME:
+                return c
+        sys.exit(f"FATAL: no Kubernetes cluster named {CLUSTER_NAME!r} found.")
+    if len(k8s_clusters) > 1:
+        names = ", ".join(c["name"] for c in k8s_clusters)
+        sys.exit(f"FATAL: more than one Kubernetes cluster exists ({names}). "
+                 f"Order again and pick one in the Cluster Name field.")
+    return k8s_clusters[0]
+
+
+def master_ssh_host(cluster):
+    for s in cluster.get("servers", []):
+        node_type = (s.get("computeServerType") or {}).get("nodeType", "")
+        if node_type == "kube-master":
+            detail = api_get(f"/api/servers/{s['id']}").get("server", {})
+            return detail.get("sshHost"), detail.get("sshPort") or 22
+    sys.exit("FATAL: could not find a master node for this cluster.")
+
+
+def ssh_run(host, port, remote_cmd, stdin_data=None, timeout=60):
+    cmd = ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
+           "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password",
+           "-o", "ConnectTimeout=10", f"{SSH_USER}@{host}", remote_cmd]
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp(cmd[0], cmd)
+        os._exit(1)
+    output = b""
+    sent_password = False
+    sent_stdin = stdin_data is None
+    start = time.time()
+    while time.time() - start < timeout:
+        r, _, _ = select.select([fd], [], [], 1)
+        if fd in r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if not sent_password and b"assword:" in chunk:
+                os.write(fd, (SSH_PASS + "\n").encode())
+                sent_password = True
+            elif sent_password and not sent_stdin:
+                os.write(fd, stdin_data.encode())
+                os.write(fd, b"\x04")
+                sent_stdin = True
+        else:
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if done != 0:
+                return output.decode(errors="replace"), status
+    # Loop above only stops reading on timeout, it doesn't stop the remote
+    # command -- a genuinely hung remote command would make a plain blocking
+    # waitpid here hang forever too. Force it.
+    import signal
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        status = 0
+    return output.decode(errors="replace"), status
+
+
+def exit_code_of(raw_status):
+    return os.WEXITSTATUS(raw_status) if os.WIFEXITED(raw_status) else raw_status
+
+
+def run_kubectl(host, port, args):
+    cmd = f"sudo kubectl --kubeconfig={KUBECONFIG} {args}"
+    out, status = ssh_run(host, port, cmd)
+    return out.strip(), exit_code_of(status)
+
+
+def find_demo_url(host, port):
+    out, code = run_kubectl(host, port,
+        "get svc -n ingress-nginx ingress-nginx-controller "
+        "-o jsonpath='{.spec.ports[?(@.port==80)].nodePort}'")
+    node_port = out.splitlines()[-1].strip() if out else ""
+    if code != 0 or not node_port.isdigit():
+        return None
+    out2, code2 = run_kubectl(host, port,
+        "get pods -n ingress-nginx -l app.kubernetes.io/component=controller "
+        "-o jsonpath='{.items[0].status.hostIP}'")
+    node_ip = out2.splitlines()[-1].strip() if out2 else ""
+    target = node_ip if (code2 == 0 and node_ip) else host
+    return PUBLIC_APP_URL or f"http://{target}:{node_port}/"
+
+
+def main():
+    cluster = pick_cluster()
+    print(f"using cluster: {cluster['name']}")
+    host, port = master_ssh_host(cluster)
+    print(f"master node: {host}:{port}")
+
+    live, code = run_kubectl(host, port,
+        f"get svc k8s-showcase -n {NAMESPACE} -o jsonpath='{{.spec.selector.slot}}'")
+    if code != 0:
+        sys.exit("FATAL: no k8s-showcase Service found. Order 'Deploy K8s Showcase App' first.")
+    live = live.splitlines()[-1].strip() if live else ""
+    if live not in ("blue", "green"):
+        sys.exit(f"FATAL: could not read the current live slot (got {live!r}).")
+
+    target = "green" if live == "blue" else "blue"
+    print(f"currently live: {live!r}. Switching to: {target!r}.")
+
+    target_replicas, code = run_kubectl(host, port,
+        f"get deployment k8s-showcase-{target} -n {NAMESPACE} -o jsonpath='{{.spec.replicas}}'")
+    if code != 0:
+        sys.exit(f"FATAL: slot {target!r} has no deployment yet. "
+                 f"Order 'Deploy K8s Showcase App' with color={target!r} first.")
+    target_replicas = target_replicas.splitlines()[-1].strip() if target_replicas else "0"
+    if not target_replicas.isdigit() or int(target_replicas) < 1:
+        sys.exit(f"FATAL: slot {target!r} is deployed but scaled to 0 (it was the standby "
+                 f"from an earlier switch). Order 'Deploy K8s Showcase App' with color={target!r} "
+                 f"again first -- that both refreshes it and scales it back up.")
+
+    patch = '{"spec":{"selector":{"slot":"%s"}}}' % target
+    out, code = run_kubectl(host, port,
+        f"patch svc k8s-showcase -n {NAMESPACE} -p '{patch}'")
+    print(out)
+    if code != 0:
+        sys.exit(f"FATAL: switching traffic failed, exit code {code}")
+    print(f"Traffic is now live on slot {target!r}.")
+
+    # Real blue-green doesn't run double capacity forever: once the new slot is
+    # confirmed live, scale the old one to 0 rather than deleting it -- a quick
+    # `kubectl scale --replicas=N` (or another Deploy order) brings it straight
+    # back for a fast rollback, without needing to recreate anything.
+    _, scale_code = run_kubectl(host, port,
+        f"scale deployment k8s-showcase-{live} -n {NAMESPACE} --replicas=0")
+    if scale_code == 0:
+        print(f"Scaled down the previous slot ({live!r}) to 0 replicas -- "
+              f"only the live slot runs pods now, matching how real blue-green works. "
+              f"Re-run 'Deploy K8s Showcase App' with color={live!r} to bring it back.")
+    else:
+        print(f"Note: could not scale down the previous slot ({live!r}) -- it's still running "
+              f"alongside the new live slot, not a failure of the switch itself.")
+
+    url = find_demo_url(host, port)
+    if url:
+        print(f"Open it here: {url}")
+
+
+if __name__ == "__main__":
+    main()

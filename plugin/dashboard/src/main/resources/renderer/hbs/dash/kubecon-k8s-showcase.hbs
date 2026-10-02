@@ -1,0 +1,327 @@
+{{!
+  K8s Showcase status widget. Server rendered, decisions made in K8sShowcaseView,
+  not here. Three states: not configured, unreachable, and the normal live view.
+}}
+<div class="kcs">
+  <style>
+    .kcs{
+      --kcs-surface:#FFFFFF; --kcs-line:#DFE3E8; --kcs-ink:#111823; --kcs-ink-2:#57616F;
+      --kcs-blue:#1769E0; --kcs-blue-soft:#E6F0FE; --kcs-green:#177A52; --kcs-green-soft:#E1F3EB;
+      --kcs-warn:#9A6510; --kcs-warn-soft:#FBF0DC;
+      color-scheme:light; color:var(--kcs-ink); background:var(--kcs-surface);
+      border:1px solid var(--kcs-line); border-radius:10px; padding:16px 18px;
+      font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    }
+    html[data-mode="dark"] .kcs{
+      --kcs-surface:#242424; --kcs-line:#3a3a3a; --kcs-ink:#f2f1ee; --kcs-ink-2:#c6c4bd;
+      --kcs-blue:#5b9dff; --kcs-blue-soft:#1b2c47; --kcs-green:#3fd63f; --kcs-green-soft:#1e3620;
+      --kcs-warn:#ffc356; --kcs-warn-soft:#3a301c;
+      color-scheme:dark;
+    }
+    .kcs h3{ margin:0 0 10px; font-size:15px; }
+    .kcs .kcs-msg{ color:var(--kcs-ink-2); }
+    .kcs .kcs-row{ display:flex; gap:12px; margin-bottom:10px; }
+    .kcs .kcs-card{ flex:1; border:1px solid var(--kcs-line); border-radius:8px; padding:10px 12px; }
+    .kcs .kcs-card.kcs-live{ box-shadow:0 0 0 2px var(--kcs-warn) inset; }
+    .kcs .kcs-dot{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+    .kcs .kcs-dot.kcs-blue{ background:var(--kcs-blue); }
+    .kcs .kcs-dot.kcs-green{ background:var(--kcs-green); }
+    .kcs .kcs-badge{ display:inline-block; font-size:11px; font-weight:600; padding:1px 7px;
+      border-radius:999px; margin-left:6px; }
+    .kcs .kcs-badge.kcs-live-badge{ background:var(--kcs-warn-soft); color:var(--kcs-warn); }
+    .kcs .kcs-ver{ font-size:18px; font-weight:600; }
+    .kcs .kcs-sub{ color:var(--kcs-ink-2); font-size:12px; }
+    .kcs .kcs-btn{ display:inline-block; margin-top:4px; margin-right:10px; padding:7px 14px;
+      border-radius:7px; font-size:13px; font-weight:600; text-decoration:none;
+      background:var(--kcs-blue); color:#fff; }
+    .kcs .kcs-btn:hover{ opacity:.9; }
+    .kcs .kcs-btn.kcs-btn-secondary{ background:var(--kcs-blue-soft); color:var(--kcs-blue); }
+    html[data-mode="dark"] .kcs .kcs-btn.kcs-btn-secondary{ color:#cfe0ff; }
+    .kcs .kcs-none{ color:var(--kcs-ink-2); font-style:italic; }
+    .kcs .kcs-activity{ font-size:12px; color:var(--kcs-ink-2); margin:2px 0 12px; }
+    .kcs .kcs-activity strong{ color:var(--kcs-ink); font-weight:600; }
+    .kcs .kcs-links{ margin:10px 0 4px; }
+    .kcs details.kcs-pods{ margin-top:12px; }
+    .kcs details.kcs-pods summary{ cursor:pointer; color:var(--kcs-ink-2); font-size:11px;
+      text-transform:uppercase; letter-spacing:.05em; user-select:none; }
+    .kcs table.kcs-pod-table{ width:100%; border-collapse:collapse; margin-top:8px; font-size:12px; }
+    .kcs table.kcs-pod-table th{ text-align:left; color:var(--kcs-ink-2); font-weight:600;
+      font-size:10px; text-transform:uppercase; letter-spacing:.04em; padding:4px 8px 4px 0; }
+    .kcs table.kcs-pod-table td{ padding:4px 8px 4px 0; border-top:1px solid var(--kcs-line); }
+    .kcs table.kcs-pod-table td.kcs-pod-name{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+
+    .kcs .kcs-section{ margin-top:16px; padding-top:14px; border-top:1px solid var(--kcs-line); }
+    .kcs .kcs-section-title{ font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+      color:var(--kcs-ink-2); font-weight:600; margin-bottom:8px; }
+    .kcs .kcs-kpi-row{ display:grid; grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); gap:10px; }
+    .kcs .kcs-kpi{ background:var(--kcs-blue-soft); border-radius:8px; padding:8px 10px; }
+    html[data-mode="dark"] .kcs .kcs-kpi{ background:#1c2838; }
+    .kcs .kcs-kpi-n{ font-size:18px; font-weight:700; line-height:1.2; }
+    .kcs .kcs-kpi-l{ font-size:10px; text-transform:uppercase; letter-spacing:.04em; color:var(--kcs-ink-2); margin-top:2px; }
+
+    .kcs .kcs-chip-row{ display:flex; flex-wrap:wrap; gap:6px; }
+    .kcs .kcs-chip{ display:inline-flex; align-items:center; gap:5px; font-size:11px;
+      border:1px solid var(--kcs-line); border-radius:6px; padding:3px 8px; background:var(--kcs-surface); }
+    .kcs .kcs-chip .kcs-chip-kind{ font-weight:700; color:var(--kcs-ink-2); font-size:9px;
+      text-transform:uppercase; letter-spacing:.03em; }
+    .kcs .kcs-chip.kcs-chip-empty{ color:var(--kcs-ink-2); font-style:italic; border-style:dashed; }
+
+    .kcs .kcs-flow{ display:flex; flex-wrap:wrap; align-items:stretch; gap:10px; }
+    .kcs .kcs-box{ border:1px solid var(--kcs-line); border-radius:8px; padding:9px 11px; min-width:120px; }
+    .kcs .kcs-box-label{ font-size:9px; text-transform:uppercase; letter-spacing:.04em;
+      color:var(--kcs-ink-2); font-weight:700; margin-bottom:4px; }
+    .kcs .kcs-box-name{ font-size:12px; font-weight:600; }
+    .kcs .kcs-arrow{ align-self:center; color:var(--kcs-ink-2); font-size:16px; }
+
+    .kcs .kcs-rtree{ display:flex; flex-direction:column; align-items:center; }
+    .kcs .kcs-rtree-root{ border:1.5px solid var(--kcs-ink-2); border-radius:8px; padding:7px 16px;
+      font-size:12px; font-weight:700; background:var(--kcs-blue-soft); }
+    html[data-mode="dark"] .kcs .kcs-rtree-root{ background:#1c2838; }
+    .kcs .kcs-rtree-stem{ width:1px; height:12px; background:var(--kcs-line); }
+    .kcs .kcs-rtree-bar{ height:1px; background:var(--kcs-line); align-self:stretch; margin:0 10px; }
+    .kcs .kcs-rtree-children{ display:flex; flex-wrap:wrap; justify-content:center; gap:10px; width:100%; }
+    .kcs .kcs-rtree-child{ display:flex; flex-direction:column; align-items:center; }
+    .kcs .kcs-rtree-child-stem{ width:1px; height:10px; background:var(--kcs-line); }
+    .kcs .kcs-pod-dots{ display:flex; flex-wrap:wrap; gap:4px; margin-top:7px; }
+    .kcs .kcs-pod-dot{ width:13px; height:13px; border-radius:4px; cursor:default; }
+    .kcs .kcs-pod-dot.kcs-health-green{ background:#1fb155; }
+    .kcs .kcs-pod-dot.kcs-health-amber{ background:#e2a300; }
+    .kcs .kcs-pod-dot.kcs-health-red{ background:#d6453d; }
+    .kcs .kcs-legend{ display:flex; gap:12px; font-size:10px; color:var(--kcs-ink-2); margin-top:10px; }
+    .kcs .kcs-legend-dot{ width:9px; height:9px; border-radius:3px; display:inline-block; margin-right:4px; vertical-align:middle; }
+
+    .kcs .kcs-activity-list{ list-style:none; margin:0; padding:0; font-size:12px; }
+    .kcs .kcs-activity-list li{ padding:6px 0; border-top:1px solid var(--kcs-line); display:flex; align-items:flex-start; gap:8px; }
+    .kcs .kcs-activity-list li:first-child{ border-top:none; }
+    .kcs .kcs-activity-status-dot{ width:8px; height:8px; border-radius:50%; margin-top:5px; flex-shrink:0; }
+    .kcs .kcs-activity-status-dot.kcs-status-success{ background:#1fb155; }
+    .kcs .kcs-activity-status-dot.kcs-status-error{ background:#d6453d; }
+    .kcs .kcs-activity-who{ font-weight:600; }
+    .kcs .kcs-activity-when{ color:var(--kcs-ink-2); font-size:11px; }
+
+    .kcs .kcs-cost-row{ display:flex; gap:16px; flex-wrap:wrap; align-items:baseline; }
+    .kcs .kcs-cost-figure{ font-size:22px; font-weight:700; }
+    .kcs .kcs-cost-label{ font-size:11px; color:var(--kcs-ink-2); text-transform:uppercase; letter-spacing:.04em; }
+    .kcs .kcs-cost-note{ font-size:11px; color:var(--kcs-ink-2); margin-top:6px; }
+
+    @keyframes kcsFadeIn{ from{ opacity:0; transform:translateY(3px); } to{ opacity:1; transform:translateY(0); } }
+    .kcs .kcs-row, .kcs .kcs-section{ animation:kcsFadeIn .35s ease-out both; }
+    .kcs .kcs-section:nth-of-type(2){ animation-delay:.05s; }
+    .kcs .kcs-section:nth-of-type(3){ animation-delay:.1s; }
+    .kcs .kcs-section:nth-of-type(4){ animation-delay:.15s; }
+    @keyframes kcsPulse{ 0%,100%{ box-shadow:0 0 0 0 rgba(154,101,16,.4); } 50%{ box-shadow:0 0 0 4px rgba(154,101,16,0); } }
+    .kcs .kcs-badge.kcs-live-badge{ animation:kcsPulse 2s ease-in-out infinite; }
+  </style>
+
+  <h3>K8s Showcase App{{#if clusterName}} &middot; {{clusterName}}{{/if}}</h3>
+
+  {{#unless reachable}}
+    <div class="kcs-msg">{{errorMessage}}</div>
+  {{else}}
+    <div class="kcs-activity">
+      {{#if lastDeploy}}Last deploy: <strong>{{lastDeploy.by}}</strong> &middot; {{lastDeploy.when}}{{/if}}
+      {{#if lastSwitch}}{{#if lastDeploy}} &nbsp;|&nbsp; {{/if}}Last switch: <strong>{{lastSwitch.by}}</strong> &middot; {{lastSwitch.when}}{{/if}}
+    </div>
+    <div class="kcs-row">
+      <div class="kcs-card{{#if blueLive}} kcs-live{{/if}}">
+        <div><span class="kcs-dot kcs-blue"></span><strong>Blue</strong>
+          {{#if blueLive}}<span class="kcs-badge kcs-live-badge">LIVE</span>{{/if}}
+        </div>
+        {{#if blue}}
+          <div class="kcs-ver">{{blue.version}}</div>
+          <div class="kcs-sub">{{blue.ready}} / {{blue.desired}} pods ready</div>
+        {{else}}
+          <div class="kcs-none">not deployed</div>
+        {{/if}}
+      </div>
+      <div class="kcs-card{{#if greenLive}} kcs-live{{/if}}">
+        <div><span class="kcs-dot kcs-green"></span><strong>Green</strong>
+          {{#if greenLive}}<span class="kcs-badge kcs-live-badge">LIVE</span>{{/if}}
+        </div>
+        {{#if green}}
+          <div class="kcs-ver">{{green.version}}</div>
+          <div class="kcs-sub">{{green.ready}} / {{green.desired}} pods ready</div>
+        {{else}}
+          <div class="kcs-none">not deployed</div>
+        {{/if}}
+      </div>
+    </div>
+
+    <div class="kcs-links">
+      {{#if url}}<a class="kcs-btn" href="{{url}}" target="_blank" rel="noopener">Open the app</a>{{/if}}
+      {{#if grafanaUrl}}<a class="kcs-btn kcs-btn-secondary" href="{{grafanaUrl}}" target="_blank" rel="noopener">Grafana</a>{{/if}}
+    </div>
+
+    {{#if pods}}
+    <details class="kcs-pods">
+      <summary>Pods ({{podCount}})</summary>
+      <table class="kcs-pod-table">
+        <tr><th>Pod</th><th>Color</th><th>Ready</th><th>Restarts</th><th>Node</th></tr>
+        {{#each pods}}
+        <tr>
+          <td class="kcs-pod-name">{{this.name}}</td>
+          <td><span class="kcs-dot kcs-{{this.color}}"></span>{{this.color}}</td>
+          <td>{{this.ready}}</td>
+          <td>{{this.restarts}}</td>
+          <td>{{this.node}}</td>
+        </tr>
+        {{/each}}
+      </table>
+    </details>
+    {{/if}}
+
+    <div class="kcs-section">
+      <div class="kcs-section-title">Resources &middot; {{clusterName}} / k8s-showcase namespace</div>
+      <div class="kcs-rtree">
+        <div class="kcs-rtree-root">Namespace: k8s-showcase</div>
+        <div class="kcs-rtree-stem"></div>
+        <div class="kcs-rtree-bar"></div>
+        <div class="kcs-rtree-children">
+          <div class="kcs-rtree-child">
+            <div class="kcs-rtree-child-stem"></div>
+            <div class="kcs-box">
+              <div class="kcs-box-label">Service</div>
+              {{#if resources.services}}{{#each resources.services}}<div class="kcs-box-name">{{this.name}} :{{this.ports}}</div>{{/each}}{{else}}<div class="kcs-none">none</div>{{/if}}
+            </div>
+          </div>
+          <div class="kcs-rtree-child">
+            <div class="kcs-rtree-child-stem"></div>
+            <div class="kcs-box">
+              <div class="kcs-box-label">Ingress</div>
+              {{#if resources.ingresses}}{{#each resources.ingresses}}<div class="kcs-box-name">{{this.name}}</div>{{/each}}{{else}}<div class="kcs-none">none</div>{{/if}}
+            </div>
+          </div>
+          <div class="kcs-rtree-child">
+            <div class="kcs-rtree-child-stem"></div>
+            <div class="kcs-box">
+              <div class="kcs-box-label">ConfigMap</div>
+              {{#if resources.configMaps}}{{#each resources.configMaps}}<div class="kcs-box-name">{{this.name}}</div>{{/each}}{{else}}<div class="kcs-none">none</div>{{/if}}
+            </div>
+          </div>
+          <div class="kcs-rtree-child">
+            <div class="kcs-rtree-child-stem"></div>
+            <div class="kcs-box">
+              <div class="kcs-box-label">Secret</div>
+              {{#if resources.secrets}}{{#each resources.secrets}}<div class="kcs-box-name">{{this.name}}</div>{{/each}}{{else}}<div class="kcs-none">none</div>{{/if}}
+            </div>
+          </div>
+          {{#if blueLive}}
+          <div class="kcs-rtree-child">
+            <div class="kcs-rtree-child-stem"></div>
+            <div class="kcs-box">
+              <div class="kcs-box-label">Deployment: blue (live) &middot; {{blue.version}}</div>
+              <div class="kcs-pod-dots">
+                {{#each bluePods}}<span class="kcs-pod-dot kcs-health-{{this.health}}" title="{{this.name}} &middot; {{this.phase}} &middot; {{this.restarts}} restart(s)"></span>{{else}}<span class="kcs-none">no pods</span>{{/each}}
+              </div>
+            </div>
+          </div>
+          {{/if}}
+          {{#if greenLive}}
+          <div class="kcs-rtree-child">
+            <div class="kcs-rtree-child-stem"></div>
+            <div class="kcs-box">
+              <div class="kcs-box-label">Deployment: green (live) &middot; {{green.version}}</div>
+              <div class="kcs-pod-dots">
+                {{#each greenPods}}<span class="kcs-pod-dot kcs-health-{{this.health}}" title="{{this.name}} &middot; {{this.phase}} &middot; {{this.restarts}} restart(s)"></span>{{else}}<span class="kcs-none">no pods</span>{{/each}}
+              </div>
+            </div>
+          </div>
+          {{/if}}
+        </div>
+      </div>
+
+      <div class="kcs-legend">
+        <span><span class="kcs-legend-dot" style="background:#1fb155"></span>Running, no restarts</span>
+        <span><span class="kcs-legend-dot" style="background:#e2a300"></span>Running, has restarted</span>
+        <span><span class="kcs-legend-dot" style="background:#d6453d"></span>Not running</span>
+      </div>
+    </div>
+
+    <div class="kcs-section">
+      <div class="kcs-section-title">Live Metrics</div>
+      {{#if hasMetrics}}
+      <div class="kcs-kpi-row">
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{metrics.appCpuCores}}</div><div class="kcs-kpi-l">App CPU (cores)</div></div>
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{metrics.appMemMb}}</div><div class="kcs-kpi-l">App Mem (MB)</div></div>
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{metrics.appRestarts}}</div><div class="kcs-kpi-l">Restarts</div></div>
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{metrics.clusterNodes}}</div><div class="kcs-kpi-l">Cluster Nodes</div></div>
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{metrics.clusterCpuPct}}%</div><div class="kcs-kpi-l">Cluster CPU</div></div>
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{metrics.clusterMemUsedGb}}/{{metrics.clusterMemTotalGb}}</div><div class="kcs-kpi-l">Cluster Mem (GB)</div></div>
+      </div>
+      {{else}}
+      <div class="kcs-none">Order "Open Observability (Grafana + Prometheus)" to see live metrics here.</div>
+      {{/if}}
+    </div>
+
+    <div class="kcs-section">
+      <div class="kcs-section-title">SLO (last 15 min)</div>
+      {{#if hasSlo}}
+      <div class="kcs-kpi-row">
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{slo.readyPct}}%</div><div class="kcs-kpi-l">Ready</div></div>
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{slo.targetPct}}%</div><div class="kcs-kpi-l">Target</div></div>
+        <div class="kcs-kpi"><div class="kcs-kpi-n">{{slo.errorBudgetRemainingPct}}%</div><div class="kcs-kpi-l">Error Budget Left</div></div>
+      </div>
+      {{else}}
+      <div class="kcs-none">Order "Open Observability (Grafana + Prometheus)" to see this here.</div>
+      {{/if}}
+    </div>
+
+    <div class="kcs-section">
+      <div class="kcs-section-title">Automation</div>
+      <div class="kcs-kpi-row">
+        <div class="kcs-kpi">
+          <div class="kcs-kpi-n">{{#if canaryActive}}{{canary.weightPct}}%{{else}}Off{{/if}}</div>
+          <div class="kcs-kpi-l">{{#if canaryActive}}Canary &rarr; {{canary.color}}{{else}}Canary Split{{/if}}</div>
+        </div>
+        <div class="kcs-kpi">
+          <div class="kcs-kpi-n">{{#if trafficGenEnabled}}On{{else}}Off{{/if}}</div>
+          <div class="kcs-kpi-l">{{#if trafficGenEnabled}}Synthetic Traffic ({{trafficGen.ready}} pod){{else}}Synthetic Traffic{{/if}}</div>
+        </div>
+      </div>
+      <div class="kcs-cost-note">Auto-rollback runs inside the GitOps CronJob: a GitOps-triggered switch that doesn't go fully ready within 150s reverts itself automatically (shows up below as a "Rollback K8s Showcase App" entry).</div>
+    </div>
+
+    <div class="kcs-section">
+      <div class="kcs-section-title">Cost</div>
+      {{#if costFromOpenCost}}
+      <div class="kcs-cost-row">
+        <div><div class="kcs-cost-figure">${{cost.clusterMonthly}}</div><div class="kcs-cost-label">Whole cluster / month</div></div>
+        <div><div class="kcs-cost-figure">${{cost.appMonthly}}</div><div class="kcs-cost-label">This app / month</div></div>
+      </div>
+      <div class="kcs-cost-note">Via OpenCost</div>
+      {{#if cost.pods}}
+      <table class="kcs-pod-table" style="margin-top:10px;">
+        <tr><th>Pod</th><th>$ / month</th></tr>
+        {{#each cost.pods}}
+        <tr><td><span class="kcs-dot kcs-{{this.color}}"></span>{{this.color}}</td><td>${{this.monthly}}</td></tr>
+        {{/each}}
+      </table>
+      {{/if}}
+      {{else}}
+      <div class="kcs-cost-row">
+        <div><div class="kcs-cost-figure">${{cost.clusterMonthly}}</div><div class="kcs-cost-label">Billed this month</div></div>
+      </div>
+      <div class="kcs-cost-note">No price plan attached. Order "Open Observability" for real cost data.</div>
+      {{/if}}
+    </div>
+
+    <div class="kcs-section">
+      <div class="kcs-section-title">Recent Activity (top 5)</div>
+      {{#if activity}}
+      <ul class="kcs-activity-list">
+        {{#each activity}}
+        <li>
+          <span class="kcs-activity-status-dot kcs-status-{{this.status}}"></span>
+          <div>
+            <span class="kcs-activity-who">{{this.user}}</span> ran <strong>{{this.message}}</strong>
+            <div class="kcs-activity-when">{{this.status}} &middot; took {{this.durationSec}}s &middot; {{this.when}}</div>
+          </div>
+        </li>
+        {{/each}}
+      </ul>
+      {{else}}
+      <div class="kcs-none">No recorded activity yet.</div>
+      {{/if}}
+    </div>
+  {{/unless}}
+</div>
